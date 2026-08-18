@@ -1,0 +1,39 @@
+# Secrets / auth
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
+# Runtime / challenge artifacts
+artifacts/
+browser-artifacts/
+*.core
+core
+core.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Archives generated for release
+*.zip
+
+# AI client state if someone accidentally copies it into this repo
+.codex/
+.claude/
+.gemini/
+.antigravity/
+.auth/
+*oauth*
+*cookies*

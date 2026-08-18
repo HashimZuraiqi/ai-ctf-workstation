@@ -1,0 +1,6 @@
+[project]
+name = "ctf-osint-mcp"
+version = "0.1.0"
+description = "Allowlisted OSINT MCP helpers for authorized CTF challenges"
+requires-python = ">=3.12"
+dependencies = ["mcp[cli]>=2,<3"]

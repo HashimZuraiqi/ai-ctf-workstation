@@ -1,0 +1,10 @@
+{
+  "browser": {
+    "browserName": "chromium",
+    "isolated": true,
+    "launchOptions": {
+      "headless": false
+    }
+  },
+  "outputDir": "__HOME__/ctf/browser-artifacts"
+}

@@ -1,0 +1,15 @@
+# Never commit local credentials or browser state.
+.env
+.env.*
+*.key
+*.pem
+
+# Runtime clutter
+*.core
+core
+core.*
+__pycache__/
+.pytest_cache/
+
+# Large browser/runtime artifacts are local by default.
+browser-artifacts/

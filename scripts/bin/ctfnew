@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+usage(){ echo "Usage: ctfnew <challenge-name> [category]" >&2; exit 2; }
+[[ $# -ge 1 && $# -le 2 ]] || usage
+name="$1"; category="${2:-misc}"
+[[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid challenge name" >&2; exit 2; }
+root="$HOME/ctf/$name"; template="$HOME/.local/share/ctf-ai-workstation/challenge-template"
+[[ ! -e "$root" ]] || { echo "Refusing to overwrite existing workspace: $root" >&2; exit 1; }
+mkdir -p "$root"/{input,work,notes,exploit,scripts,artifacts,browser-artifacts}
+[[ ! -d "$template" ]] || cp -a "$template/." "$root/"
+printf '%s\n' "$category" > "$root/.ctf-category"
+for f in AGENTS.md GEMINI.md CLAUDE.md; do [[ -f "$root/$f" ]] && sed -i "s/{{CATEGORY}}/$category/g" "$root/$f"; done
+mkdir -p "$root/.agents"
+[[ ! -d "$HOME/.agents/skills" ]] || ln -sfn "$HOME/.agents/skills" "$root/.agents/skills"
+command -v git >/dev/null 2>&1 && git -C "$root" init -q
+cat <<EOF_NEXT
+Created: $root
+Category: $category
+Next:
+  cd "$root"
+  cp /path/to/challenge-files ./input/
+  sha256sum input/* | tee notes/input-sha256.txt
+EOF_NEXT

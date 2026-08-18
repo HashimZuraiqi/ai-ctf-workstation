@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+profile="${1:-status}"
+# ghidra gdb playwright forensics crypto osint
+case "$profile" in
+  rev|pwn|mobile) vals="1 1 0 0 0 0" ;;
+  web)            vals="0 0 1 0 0 0" ;;
+  forensics)      vals="0 0 0 1 0 0" ;;
+  crypto)         vals="0 0 0 0 1 0" ;;
+  osint)          vals="0 0 1 0 0 1" ;;
+  all)            vals="1 1 1 1 1 1" ;;
+  off)            vals="0 0 0 0 0 0" ;;
+  status)         vals="" ;;
+  *) echo "Usage: ctf-mcp {rev|pwn|web|forensics|crypto|osint|mobile|all|off|status}" >&2; exit 2 ;;
+esac
+if [[ "$profile" != status ]]; then read -r want_ghidra want_gdb want_playwright want_forensics want_crypto want_osint <<<"$vals"; fi
+
+export PATH="$HOME/.local/bin:$PATH"
+GHIDRA_MCP_DIR="$HOME/tools/ghidra-mcp"
+UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"
+PLAYWRIGHT_CFG="$HOME/.config/ctf-ai/playwright-mcp.json"
+AGY_CFG="$HOME/.gemini/config/mcp_config.json"
+FORENSICS_DIR="$HOME/tools/ctf-forensics-mcp"
+CRYPTO_DIR="$HOME/tools/ctf-crypto-mcp"
+OSINT_DIR="$HOME/tools/ctf-osint-mcp"
+
+codex_remove(){ command -v codex >/dev/null 2>&1 || return 0; codex mcp remove "$1" >/dev/null 2>&1 || true; }
+server_ready(){ [[ -x "$1/.venv/bin/python" && -f "$1/server.py" ]]; }
+warn_missing(){ printf '[WARN] %s is not installed; run the corresponding install phase or bootstrap again.\n' "$1" >&2; }
+
+codex_add_ghidra(){ codex_remove ghidra; codex mcp add ghidra --env GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS=1 -- "$UV_BIN" run --directory "$GHIDRA_MCP_DIR" bridge-mcp-ghidra; }
+codex_add_gdb(){ codex_remove gdb; codex mcp add gdb -- npx -y mcp-gdb; }
+codex_add_playwright(){ codex_remove playwright; codex mcp add playwright -- npx -y @playwright/mcp@latest --config "$PLAYWRIGHT_CFG"; }
+codex_add_custom(){
+  local name="$1" dir="$2"
+  codex_remove "$name"
+  if server_ready "$dir"; then
+    codex mcp add "$name" --env CTF_ROOT="$HOME/ctf" -- "$dir/.venv/bin/python" "$dir/server.py"
+  else
+    warn_missing "$name MCP"
+  fi
+}
+
+update_antigravity(){
+  local g="$1" d="$2" p="$3" f="$4" c="$5" o="$6"
+  mkdir -p "$(dirname "$AGY_CFG")"
+  python3 - "$AGY_CFG" "$g" "$d" "$p" "$f" "$c" "$o" "$UV_BIN" "$GHIDRA_MCP_DIR" "$PLAYWRIGHT_CFG" "$FORENSICS_DIR" "$CRYPTO_DIR" "$OSINT_DIR" "$HOME/ctf" <<'PY_AGY'
+import json, sys
+from pathlib import Path
+cfg=Path(sys.argv[1]); enabled=[bool(int(x)) for x in sys.argv[2:8]]
+uv,ghidra,pw,forensics,crypto,osint,ctfroot=sys.argv[8:15]
+try:
+    data=json.loads(cfg.read_text()) if cfg.exists() and cfg.stat().st_size else {}
+except Exception:
+    if cfg.exists(): cfg.with_suffix(cfg.suffix+'.broken').write_bytes(cfg.read_bytes())
+    data={}
+servers=data.setdefault('mcpServers',{})
+servers['ghidra']={'command':uv,'args':['run','--directory',ghidra,'bridge-mcp-ghidra'],'env':{'GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS':'1'},'disabled':not enabled[0]}
+servers['gdb']={'command':'npx','args':['-y','mcp-gdb'],'disabled':not enabled[1]}
+servers['playwright']={'command':'npx','args':['-y','@playwright/mcp@latest','--config',pw],'disabled':not enabled[2]}
+for idx,(name,path) in enumerate([('forensics',forensics),('crypto',crypto),('osint',osint)], start=3):
+    py=str(Path(path)/'.venv/bin/python'); server=str(Path(path)/'server.py')
+    servers[name]={'command':py,'args':[server],'env':{'CTF_ROOT':ctfroot},'disabled':not enabled[idx]}
+cfg.write_text(json.dumps(data,indent=2)+'\n')
+PY_AGY
+}
+
+show_status(){
+  echo "=== Codex MCP ==="
+  if command -v codex >/dev/null 2>&1; then codex mcp list 2>/dev/null || true; else echo "codex not installed"; fi
+  echo; echo "=== Antigravity MCP ==="
+  if [[ -s "$AGY_CFG" ]]; then
+    python3 - "$AGY_CFG" <<'PY_STATUS'
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    for name,cfg in d.get('mcpServers',{}).items():
+        print(f"{name}: {'disabled' if cfg.get('disabled',False) else 'enabled'}")
+except Exception as e: print(f'invalid config: {e}')
+PY_STATUS
+  else echo "no Antigravity MCP config yet"; fi
+}
+
+if [[ "$profile" == status ]]; then show_status; exit 0; fi
+for name in ghidra gdb playwright forensics crypto osint; do codex_remove "$name"; done
+if command -v codex >/dev/null 2>&1; then
+  ((want_ghidra)) && codex_add_ghidra
+  ((want_gdb)) && codex_add_gdb
+  ((want_playwright)) && codex_add_playwright
+  ((want_forensics)) && codex_add_custom forensics "$FORENSICS_DIR"
+  ((want_crypto)) && codex_add_custom crypto "$CRYPTO_DIR"
+  ((want_osint)) && codex_add_custom osint "$OSINT_DIR"
+fi
+update_antigravity "$want_ghidra" "$want_gdb" "$want_playwright" "$want_forensics" "$want_crypto" "$want_osint"
+echo "Applied MCP profile: $profile"
+show_status

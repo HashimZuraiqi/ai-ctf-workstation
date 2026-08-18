@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+JAVA21="/usr/lib/jvm/java-21-openjdk-amd64"
+GHIDRA_DIR="${GHIDRA_DIR:-$HOME/tools/ghidra_12.1.2_PUBLIC}"
+[[ -x "$JAVA21/bin/java" ]] || { echo "Java 21 missing at $JAVA21" >&2; exit 1; }
+[[ -x "$GHIDRA_DIR/ghidraRun" ]] || { echo "Ghidra not found at $GHIDRA_DIR" >&2; exit 1; }
+export JAVA_HOME="$JAVA21"
+export PATH="$JAVA_HOME/bin:$PATH"
+exec "$GHIDRA_DIR/ghidraRun" "$@"

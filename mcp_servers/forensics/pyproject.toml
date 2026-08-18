@@ -1,0 +1,6 @@
+[project]
+name = "ctf-forensics-mcp"
+version = "0.1.0"
+description = "Local, allowlisted forensic-tool MCP server for authorized CTF workspaces"
+requires-python = ">=3.12"
+dependencies = ["mcp[cli]>=2,<3"]
