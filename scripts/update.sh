@@ -36,9 +36,11 @@ command -v git >/dev/null || { echo "git is required. Install it: sudo apt-get i
 c_log "Syncing workstation into $DIR (ref: $REF)"
 mkdir -p "$(dirname "$DIR")"
 if [[ -d "$DIR/.git" ]]; then
+  # Fetch the ref and hard-reset to it. Works even on a single-branch clone made
+  # for a different ref (FETCH_HEAD is what we just fetched), so switching --ref
+  # or moving to main always lands on the right commit.
   git -C "$DIR" fetch --depth 1 origin "$REF"
-  git -C "$DIR" checkout -q "$REF"
-  git -C "$DIR" reset --hard "origin/$REF"
+  git -C "$DIR" reset -q --hard FETCH_HEAD
 else
   git clone --depth 1 --branch "$REF" "$REPO" "$DIR" 2>/dev/null || git clone --depth 1 "$REPO" "$DIR"
 fi
