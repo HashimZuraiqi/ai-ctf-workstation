@@ -1,15 +1,23 @@
 ---
 name: ctf-pwn
-description: Develop and validate exploits for authorized CTF binary-exploitation challenges.
+description: Analyse and develop validated solutions for authorized CTF binary-exploitation challenges.
 ---
 
-Use for authorized pwn/binary-exploitation challenges.
+Use for authorized binary-exploitation challenges, against the organizer-provided service only.
 
-- Run `checksec` and document architecture, PIE, NX, canary, RELRO and libc assumptions.
-- Reproduce the crash/primitive locally first.
-- Use Pwndbg/GDB for breakpoints, registers, stack/heap state and backtraces.
-- Create a pwntools script early; separate local/remote settings.
-- Derive offsets with evidence (for example cyclic patterns), not guesses.
-- Make leaks/parsing deterministic and assert expected lengths/ranges.
-- Record remote differences and required loader/libc files.
-- Stay on the organizer-provided service and do not reuse techniques on unrelated targets.
+**Characterise the target:**
+- `checksec`: record arch, PIE, NX, canary, RELRO, and the libc version/file provided.
+- Identify the input path and the vulnerable primitive class (unbounded copy, format string, off-by-one, UAF/double-free, integer issue). `ctftriage` flags unbounded-input functions during static triage.
+- Note any `seccomp` filter (dump with seccomp-tools) and whether a `win`/backdoor function exists.
+
+**Build evidence-first:**
+- Reproduce the crash locally before theorising. Use Pwndbg to inspect registers, stack and heap state.
+- Derive offsets from evidence (cyclic patterns), not guesses.
+- Write a pwntools script early with separate local/remote settings; assert leak lengths and ranges so wrong assumptions fail loudly.
+- For heap work, match the exact libc; model allocator behaviour step by step.
+
+**Validate:**
+- Confirm the solution works locally, then only against the organizer endpoint.
+- Record remote differences and the required loader/libc. Keep the final script reproducible in `exploit/`.
+
+Stay strictly within CTF scope; never reuse techniques on unrelated systems.

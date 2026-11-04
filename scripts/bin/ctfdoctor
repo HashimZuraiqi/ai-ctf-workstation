@@ -14,7 +14,7 @@ if grep -Rqs 'Suites: kali-rolling' /etc/apt/sources.list.d 2>/dev/null; then ok
 if command -v dpkg >/dev/null 2>&1 && [[ -z "$(dpkg --audit 2>/dev/null)" ]]; then ok "dpkg audit clean"; else warn "dpkg audit returned output"; fi
 
 printf '\n-- Core --\n'
-for c in git curl jq node npm npx uv gdb gdb-multiarch checksec rz-bin qemu-x86_64 docker ctfnew ctf-mcp ghidra-ai; do cmd_required "$c"; done
+for c in git curl jq node npm npx uv gdb gdb-multiarch checksec rz-bin qemu-x86_64 docker ctfnew ctf-mcp ghidra-ai ctftriage ctfflag; do cmd_required "$c"; done
 for c in codex agy claude gemini pwndbg cutter jadx apktool playwright-cli; do cmd_optional "$c"; done
 
 VENV="$HOME/.venvs/ctf-core"
@@ -48,6 +48,13 @@ for c in openssl john hashcat hashid gp ccrypt aesfix aeskeyfind stegsnow xortoo
 
 printf '\n-- OSINT --\n'
 for c in whois dig dnsrecon dnsenum massdns amass subfinder assetfinder theHarvester sherlock maigret recon-ng metagoofil waybackpy instaloader; do cmd_optional "$c"; done
+
+printf '\n-- CTF helpers --\n'
+if command -v ctfflag >/dev/null 2>&1 && ctfflag decode "ZmxhZ3t0ZXN0fQ==" 2>/dev/null | grep -q "flag{test}"; then ok "ctfflag decoder works"; else warn "ctfflag decode self-test failed"; fi
+if command -v ctftriage >/dev/null 2>&1; then ok "ctftriage installed"; else warn "ctftriage missing"; fi
+if command -v ctfsolve >/dev/null 2>&1; then
+  if [[ -n "${CTFSOLVE_API_BASE:-}" && -n "${CTFSOLVE_MODEL:-}" ]]; then ok "ctfsolve installed (endpoint configured)"; else warn "ctfsolve installed (set CTFSOLVE_API_BASE + CTFSOLVE_MODEL to use it)"; fi
+else warn "ctfsolve missing"; fi
 
 printf '\n-- Custom MCP servers --\n'
 for n in forensics crypto osint; do

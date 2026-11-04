@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""ctftriage - automatic first pass over authorized CTF challenge files.
+
+Runs cheap, read-only checks before any model is involved, so the agent starts
+from evidence instead of a blank page. It never modifies input/.
+
+Usage:
+  ctftriage [PATH ...] [--desc "challenge text"] [--url URL] [--nc host:port]
+            [--no-extract] [--quiet]
+
+Default PATH is input/ of the current ctfnew workspace. Writes:
+  notes/triage.md        short summary to read first (humans and agents)
+  artifacts/triage/      full raw tool output for grepping
+  work/extracted/        unpacked archives / embedded files
+
+Every external tool is optional; missing ones are skipped and listed.
+Standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import math
+import re
+import shutil
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def _load_ctfflag():
+    for cand in (HERE / "ctfflag", Path.home() / ".local/bin/ctfflag"):
+        if cand.exists():
+            loader = importlib.machinery.SourceFileLoader("ctfflag", str(cand))
+            spec = importlib.util.spec_from_loader("ctfflag", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    return None
+
+
+FLAG = _load_ctfflag()
+MISSING: set[str] = set()
+
+
+def have(tool: str) -> bool:
+    if shutil.which(tool):
+        return True
+    MISSING.add(tool)
+    return False
+
+
+def run(argv, timeout=60, cwd=None) -> str:
+    try:
+        cp = subprocess.run(argv, capture_output=True, timeout=timeout, cwd=cwd)
+        return (cp.stdout + cp.stderr).decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return f"[timeout after {timeout}s] {' '.join(argv)}"
+    except Exception as e:  # noqa: BLE001
+        return f"[error] {e}"
+
+
+def entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    c = Counter(data)
+    n = len(data)
+    return -sum(v / n * math.log2(v / n) for v in c.values())
+
+
+def workspace_root() -> Path:
+    if FLAG:
+        r = FLAG.workspace_root()
+        if r:
+            return r
+    return Path.cwd()
+
+
+class Report:
+    def __init__(self, root: Path):
+        self.root = root
+        self.lines: list[str] = []
+        self.flags: list[tuple[str, str, str]] = []
+        self.steps: list[str] = []
+        self.cats: Counter = Counter()
+        self.raw_dir = root / "artifacts" / "triage"
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+
+    def raw(self, name: str, text: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:120]
+        p = self.raw_dir / f"{safe}.txt"
+        p.write_text(text)
+        return str(p.relative_to(self.root))
+
+    def add(self, s: str = ""):
+        self.lines.append(s)
+
+    def hint(self, cat: str, weight: int, step: str | None = None):
+        self.cats[cat] += weight
+        if step and step not in self.steps:
+            self.steps.append(step)
+
+    def scan_flags(self, data: bytes, source: str):
+        if not FLAG:
+            return
+        rx = FLAG.flag_regex()
+        for r in FLAG.scan_bytes(data, rx, source, deep=len(data) < 4_000_000):
+            self.flags.append((r["flag"], r["how"], source))
+
+
+# --------------------------------------------------------- per-type checks --
+# Library calls worth noting during rev/pwn triage. Flagging their presence is
+# standard static triage; it does not constitute an exploit.
+NOTABLE_CALLS = ["gets", "strcpy", "strcat", "sprintf", "scanf", "fgets", "read",
+                 "memcpy", "system", "execve", "popen", "mprotect", "malloc", "free",
+                 "printf", "puts", "alarm", "seccomp", "fopen", "setuid"]
+
+
+def triage_elf(p: Path, R: Report):
+    R.hint("rev", 2)
+    R.hint("pwn", 2)
+    info = []
+    if have("checksec"):
+        out = run(["checksec", "--file=" + str(p)]) or run(["checksec", str(p)])
+        info.append("checksec: " + " ".join(out.split())[:400])
+    if have("rz-bin"):
+        header = run(["rz-bin", "-I", str(p)])
+        imports = run(["rz-bin", "-i", str(p)])
+        R.raw(p.name + ".rzbin", header + "\n\n== imports ==\n" + imports)
+        found = sorted({f for f in NOTABLE_CALLS if re.search(rf"\b{f}\b", imports)})
+        if found:
+            info.append("notable library calls present: " + ", ".join(found))
+        if {"gets", "strcpy", "scanf"} & set(found):
+            R.hint("pwn", 3, "Static triage flags unbounded input functions; review in Ghidra and confirm behaviour dynamically.")
+        if "seccomp" in found:
+            R.hint("pwn", 1, "seccomp present; dump the filter with seccomp-tools before planning.")
+    else:
+        info.append("rz-bin not installed; inspect in Ghidra (ghidra-ai).")
+    for line in info:
+        R.add(f"  - {line}")
+    R.hint("rev", 0, "Load the binary in Ghidra (ghidra-ai) and read main / the comparison logic.")
+
+
+def triage_pe(p: Path, R: Report):
+    R.hint("rev", 3)
+    R.add("  - Windows PE: inspect in Ghidra; check for .NET (dnSpy/ILSpy) vs native.")
+    if have("rz-bin"):
+        R.raw(p.name + ".rzbin", run(["rz-bin", "-I", str(p)]))
+
+
+def triage_image(p: Path, data: bytes, R: Report):
+    R.hint("forensics", 2)
+    R.hint("stego", 2)
+    if have("exiftool"):
+        meta = run(["exiftool", str(p)])
+        R.raw(p.name + ".exif", meta)
+        for ln in meta.splitlines():
+            if re.search(r"comment|flag|author|description|artist", ln, re.I):
+                R.add(f"  - metadata: {ln.strip()[:160]}")
+    R.hint("stego", 1, "Try zsteg (PNG), steghide/stegseek (JPG), and compare LSB planes; check appended data after image end.")
+    tail = data.rsplit(b"\xff\xd9", 1) if data[:3] == b"\xff\xd8\xff" else None
+    if tail and len(tail) == 2 and tail[1].strip():
+        R.add(f"  - {len(tail[1])} bytes appended after JPEG EOI marker (possible hidden payload).")
+
+
+def triage_pcap(p: Path, R: Report):
+    R.hint("forensics", 3)
+    R.hint("network", 3)
+    if have("tshark"):
+        proto = run(["tshark", "-r", str(p), "-q", "-z", "io,phs"], timeout=90)
+        R.raw(p.name + ".protocols", proto)
+        for ln in proto.splitlines():
+            m = re.search(r"\b(http|dns|ftp|telnet|smtp|tls|smb|icmp|usb|tcp|udp)\b", ln)
+            if m:
+                R.add(f"  - protocol seen: {ln.strip()[:120]}")
+        R.hint("network", 1, "Follow TCP/HTTP streams; export objects (tshark --export-objects); check DNS/ICMP for exfil.")
+    else:
+        R.add("  - tshark not installed; open in Wireshark.")
+
+
+def triage_archive(p: Path, R: Report, extract_dir: Path, do_extract: bool):
+    R.hint("forensics", 1)
+    import tarfile
+    import zipfile
+    try:
+        if zipfile.is_zipfile(p):
+            with zipfile.ZipFile(p) as z:
+                names = z.namelist()
+                R.add(f"  - zip with {len(names)} entries; first: {', '.join(names[:8])}")
+                if any(getattr(i, 'flag_bits', 0) & 0x1 for i in z.infolist()):
+                    R.hint("crypto", 1, "Zip is password-protected; try zip2john + john, or known-plaintext attack (bkcrack).")
+                elif do_extract:
+                    z.extractall(extract_dir / p.stem)
+        elif tarfile.is_tarfile(p):
+            with tarfile.open(p) as t:
+                R.add(f"  - tar with {len(t.getnames())} entries")
+                if do_extract:
+                    t.extractall(extract_dir / p.stem, filter="data")
+    except Exception as e:  # noqa: BLE001
+        R.add(f"  - archive read error: {e}")
+
+
+def triage_text(p: Path, data: bytes, R: Report):
+    txt = data.decode("utf-8", "replace")
+    low = txt.lower()
+    if re.search(r"-----BEGIN [A-Z ]*(PRIVATE|PUBLIC) KEY", txt) or "ssh-rsa" in txt:
+        R.hint("crypto", 3, "Key material present; identify the scheme and check for weak parameters.")
+    if re.search(r"\b[ne]\s*=\s*\d{20,}", txt) or "modulus" in low:
+        R.hint("crypto", 3, "RSA-style parameters present; run the RSA attack checklist (see ctf-crypto playbook).")
+    if re.fullmatch(r"[01\s]+", txt.strip()) and len(txt) > 32:
+        R.hint("crypto", 1, "Looks like binary; ctfflag decode will convert it.")
+    if "<?php" in low or "function(" in low or "def " in low or "#include" in low:
+        R.hint("rev", 1, "Source code present; read it for the check logic and any hard-coded secret.")
+    if len(set(txt.split())) < 40 and len(txt) > 100:
+        R.hint("crypto", 1, "Low-variety text; possible substitution/classical cipher (try quipqiup, ctfflag decode).")
+
+
+def triage_file(p: Path, R: Report, extract_dir: Path, do_extract: bool):
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        R.add(f"- {p.name}: unreadable ({e})")
+        return
+    ftype = run(["file", "-b", str(p)]).strip() if have("file") else "(file not installed)"
+    ent = entropy(data[:1_000_000])
+    R.add(f"### {p.name}  ({len(data)} bytes, entropy {ent:.2f})")
+    R.add(f"  - type: {ftype[:200]}")
+    if ent > 7.5 and "text" not in ftype.lower():
+        R.add("  - high entropy: likely compressed/encrypted/packed; try binwalk and check for embedded files.")
+        R.hint("crypto", 1)
+    R.scan_flags(data, p.name)
+
+    head = data[:16]
+    low = ftype.lower()
+    if head[:4] == b"\x7fELF":
+        triage_elf(p, R)
+    elif head[:2] == b"MZ":
+        triage_pe(p, R)
+    elif head[:3] == b"\xff\xd8\xff" or head[:8] == b"\x89PNG\r\n\x1a\n" or head[:6] in (b"GIF87a", b"GIF89a") or head[:4] == b"BM":
+        triage_image(p, data, R)
+    elif head[:4] in (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x0a\x0d\x0d\x0a") or low.startswith("pcap"):
+        triage_pcap(p, R)
+    elif head[:2] == b"PK" or head[:2] == b"\x1f\x8b" or "archive" in low or "compressed" in low:
+        triage_archive(p, R, extract_dir, do_extract)
+        if do_extract and have("binwalk"):
+            R.raw(p.name + ".binwalk", run(["binwalk", str(p)]))
+    elif head[:5] == b"%PDF-":
+        R.hint("forensics", 2, "PDF: run pdfid / pdf-parser; check for embedded files, JS, and objects after %%EOF.")
+    elif b"\x00" not in data[:4096] and len(data) < 5_000_000:
+        triage_text(p, data, R)
+    else:
+        if have("binwalk") and do_extract:
+            bw = run(["binwalk", "--dd=.*", "-C", str(extract_dir / p.stem), str(p)])
+            R.raw(p.name + ".binwalk", bw)
+            if re.search(r"\b(zip|gzip|png|elf|jpeg|tar)\b", bw, re.I):
+                R.hint("forensics", 2, "binwalk found embedded files; inspect work/extracted/.")
+
+    # strings pass for small-ish files
+    if len(data) < 20_000_000 and have("strings"):
+        ss = run(["strings", "-n", "6", str(p)])
+        R.raw(p.name + ".strings", ss)
+        interesting = [s for s in ss.splitlines()
+                       if re.search(r"(flag|ctf|password|secret|key|http[s]?://|BEGIN |AAAA|\{.*\})", s, re.I)][:12]
+        for s in interesting:
+            R.add(f"  - string: {s.strip()[:160]}")
+    R.add()
+
+
+# ------------------------------------------------------------------- main ---
+def build_report(paths, args, R: Report):
+    extract_dir = R.root / "work" / "extracted"
+    if args.no_extract is False:
+        extract_dir.mkdir(parents=True, exist_ok=True)
+    files = []
+    for pth in paths:
+        pth = Path(pth)
+        if pth.is_dir():
+            files += [q for q in sorted(pth.rglob("*")) if q.is_file()]
+        elif pth.is_file():
+            files.append(pth)
+    R.add(f"# Triage report ({len(files)} file(s))")
+    R.add()
+    if args.desc:
+        R.add(f"**Challenge description:** {args.desc}")
+        for cat, kw in {
+            "web": r"http|url|website|login|cookie|xss|sql|server|php|api|jwt|flask|node",
+            "pwn": r"\bpwn|overflow|shell|exploit|binary|libc|ret2|heap|stack|nc ",
+            "rev": r"revers|crackme|license|serial|decompil|unpack|obfuscat",
+            "crypto": r"crypt|rsa|aes|cipher|encod|hash|xor|key|signature|ecc|lattice",
+            "forensics": r"forensic|pcap|memory|dump|disk|recover|carve|volatility|image",
+            "stego": r"stego|hidden|lsb|spectrogram|steghide|least significant",
+            "osint": r"osint|find the|who is|social|username|geolocat|recon",
+            "misc": r"misc|jail|esolang|qr|sandbox",
+        }.items():
+            if re.search(kw, args.desc, re.I):
+                R.hint(cat, 2)
+        R.add()
+    if args.url:
+        R.add(f"**Target URL:** {args.url}  -> use `mcp-web`; curl headers first.")
+        R.hint("web", 4)
+    if args.nc:
+        R.add(f"**Remote service:** nc {args.nc}  -> connect and record the protocol before scripting.")
+        R.hint("pwn", 3)
+    R.add()
+
+    for f in files:
+        try:
+            triage_file(f, R, extract_dir, args.no_extract is False)
+        except Exception as e:  # noqa: BLE001
+            R.add(f"### {f.name}: triage error: {e}\n")
+
+
+def render(R: Report, args) -> str:
+    out = list(R.lines)
+    head = ["", "## Flags found" if R.flags else "## Flags found: none yet"]
+    if R.flags:
+        seen = set()
+        for flag, how, src in R.flags:
+            if flag in seen:
+                continue
+            seen.add(flag)
+            head.append(f"- `{flag}`  (via {how} in {src})")
+        head.append("")
+        head.append("Verify before trusting: `ctfflag verify '<flag>' --cmd '<solver>'`.")
+    head.append("")
+    ranked = [c for c, _ in R.cats.most_common() if R.cats[c] > 0]
+    head.append("## Likely category")
+    head.append(", ".join(f"{c} ({R.cats[c]})" for c in ranked) or "unclear - inspect manually")
+    if ranked:
+        skill = {"stego": "ctf-forensics", "network": "ctf-forensics", "rev": "ctf-reverse"}.get(ranked[0], f"ctf-{ranked[0]}")
+        head.append(f"Suggested profile/skill: `mcp-{ranked[0] if ranked[0] in ('rev','pwn','web','forensics','crypto','osint','mobile') else 'off'}`, read the `{skill}` playbook.")
+    head.append("")
+    head.append("## Suggested next tests (highest information gain first)")
+    for i, s in enumerate(R.steps[:8], 1):
+        head.append(f"{i}. {s}")
+    if not R.steps:
+        head.append("1. Inspect each file by hand; nothing stood out automatically.")
+    head.append("")
+    if MISSING:
+        head.append(f"_Tools not installed, skipped: {', '.join(sorted(MISSING))}._")
+    head.append("_Raw tool output saved under artifacts/triage/. input/ was not modified._")
+    return "\n".join(out + head) + "\n"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ctftriage", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("paths", nargs="*")
+    ap.add_argument("--desc", help="challenge description text")
+    ap.add_argument("--url", help="target web URL")
+    ap.add_argument("--nc", help="remote service host:port")
+    ap.add_argument("--no-extract", action="store_true", help="do not unpack archives / carve")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args(argv)
+
+    root = workspace_root()
+    paths = a.paths or ([str(root / "input")] if (root / "input").exists() else ["."])
+    R = Report(root)
+    build_report(paths, a, R)
+    report = render(R, a)
+
+    notes = root / "notes"
+    notes.mkdir(exist_ok=True)
+    (notes / "triage.md").write_text(report)
+    if not a.quiet:
+        sys.stdout.write(report)
+    sys.stderr.write(f"\nWrote {notes / 'triage.md'}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""ctfflag - find, decode and verify CTF flags.
+
+Usage:
+  ctfflag scan [PATH ...]            scan files/dirs (default: work/ artifacts/ notes/ input/) or '-' for stdin
+  ctfflag decode TEXT|-              run the multi-layer decoder on a string and print every flag-like hit
+  ctfflag verify FLAG [--cmd CMD]    check FLAG against the format; with --cmd, require the solver to print it
+  ctfflag format [REGEX]             show or set the flag format for the current workspace
+
+Flag format resolution (first match wins):
+  --format REGEX  >  $CTF_FLAG_REGEX  >  <workspace>/.ctf-flag-format  >  generic default
+A plain prefix like "picoCTF" or "flag{" is accepted and turned into a regex.
+
+Standard library only, so it runs in any Python 3.8+.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import codecs
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+GENERIC = r"[A-Za-z0-9_\-]{2,24}\{[^{}\s]{2,256}\}"
+MAX_FILE = int(os.environ.get("CTFFLAG_MAX_FILE", str(64 * 1024 * 1024)))
+
+
+# ---------------------------------------------------------------- format ---
+def workspace_root(start: Path | None = None) -> Path | None:
+    p = (start or Path.cwd()).resolve()
+    for d in [p, *p.parents]:
+        if (d / ".ctf-category").exists() or (d / ".ctf-flag-format").exists():
+            return d
+    return None
+
+
+def normalize_format(fmt: str) -> str:
+    fmt = fmt.strip()
+    if not fmt:
+        return GENERIC
+    # Bare prefix such as "picoCTF", "flag{" or "HTB{": escape and complete it.
+    if re.fullmatch(r"[A-Za-z0-9_\-]+\{?", fmt):
+        prefix = fmt.rstrip("{")
+        return re.escape(prefix) + r"\{[^{}\s]{1,256}\}"
+    return fmt
+
+
+def flag_regex(cli: str | None = None) -> re.Pattern[str]:
+    fmt = cli or os.environ.get("CTF_FLAG_REGEX")
+    if not fmt:
+        root = workspace_root()
+        if root and (root / ".ctf-flag-format").exists():
+            fmt = (root / ".ctf-flag-format").read_text().strip()
+    return re.compile(normalize_format(fmt or GENERIC))
+
+
+KNOWN_PREFIX = re.compile(r"(flag|ctf|key|htb|thm|pico|ductf|uiu|csaw|hack|sec)", re.I)
+
+
+def plausible(flag: str, rx: re.Pattern[str]) -> bool:
+    """For noisy transforms (xor/caesar) under the generic format, demand a flag-like prefix."""
+    if rx.pattern != GENERIC:
+        return True
+    head = flag.split("{", 1)[0]
+    body = flag[len(head) + 1:-1]
+    return bool(KNOWN_PREFIX.search(head)) and all(32 <= ord(c) < 127 for c in body)
+
+
+def score(flag: str) -> int:
+    head = flag.split("{", 1)[0]
+    return (10 if KNOWN_PREFIX.search(head) else 0) + (3 if re.fullmatch(r"[\w{}\-!?@.]+", flag) else 0)
+
+
+def flag_prefix(rx: re.Pattern[str]) -> bytes | None:
+    """Literal prefix before the '{' in the regex, used for XOR / caesar search."""
+    m = re.match(r"^((?:\\.|[A-Za-z0-9_])+)\\\{", rx.pattern)
+    if not m:
+        return None
+    return re.sub(r"\\(.)", r"\1", m.group(1)).encode()
+
+
+# --------------------------------------------------------------- decoders ---
+MORSE = {
+    ".-": "A", "-...": "B", "-.-.": "C", "-..": "D", ".": "E", "..-.": "F", "--.": "G", "....": "H",
+    "..": "I", ".---": "J", "-.-": "K", ".-..": "L", "--": "M", "-.": "N", "---": "O", ".--.": "P",
+    "--.-": "Q", ".-.": "R", "...": "S", "-": "T", "..-": "U", "...-": "V", ".--": "W", "-..-": "X",
+    "-.--": "Y", "--..": "Z", "-----": "0", ".----": "1", "..---": "2", "...--": "3", "....-": "4",
+    ".....": "5", "-....": "6", "--...": "7", "---..": "8", "----.": "9", "..--.-": "_", "-.--.": "(",
+    "-.--.-": ")", ".-.-.-": ".", "--..--": ",", "-.-.--": "!", "..--..": "?", "-....-": "-",
+}
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _b58(s: str) -> bytes:
+    n = 0
+    for ch in s:
+        n = n * 58 + B58.index(ch)
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\x00" * (len(s) - len(s.lstrip("1"))) + raw
+
+
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", "", s)
+
+
+def dec_base64(s):
+    t = _clean(s)
+    if len(t) < 8 or not re.fullmatch(r"[A-Za-z0-9+/=_\-]+", t):
+        return None
+    t = t.replace("-", "+").replace("_", "/")
+    return base64.b64decode(t + "=" * (-len(t) % 4), validate=False)
+
+
+def dec_base32(s):
+    t = _clean(s).upper()
+    if len(t) < 8 or not re.fullmatch(r"[A-Z2-7=]+", t):
+        return None
+    return base64.b32decode(t + "=" * (-len(t) % 8))
+
+
+def dec_base85(s):
+    t = _clean(s)
+    if len(t) < 10:
+        return None
+    if t.startswith("<~") and t.endswith("~>"):
+        return base64.a85decode(t, adobe=True)
+    try:
+        return base64.b85decode(t)
+    except Exception:
+        return base64.a85decode(t)
+
+
+def dec_base58(s):
+    t = _clean(s)
+    if len(t) < 8 or any(c not in B58 for c in t):
+        return None
+    return _b58(t)
+
+
+def dec_hex(s):
+    t = re.sub(r"(0x|\\x|[\s:,])", "", s, flags=re.I)
+    if len(t) < 6 or len(t) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", t):
+        return None
+    return bytes.fromhex(t)
+
+
+def dec_binary(s):
+    t = re.sub(r"[\s,]", "", s)
+    if len(t) < 16 or len(t) % 8 or not re.fullmatch(r"[01]+", t):
+        return None
+    return bytes(int(t[i:i + 8], 2) for i in range(0, len(t), 8))
+
+
+def dec_decimal(s):
+    parts = re.split(r"[\s,;]+", s.strip())
+    if len(parts) < 4 or not all(p.isdigit() and int(p) < 256 for p in parts):
+        return None
+    return bytes(int(p) for p in parts)
+
+
+def dec_octal(s):
+    parts = re.split(r"[\s,;\\]+", s.strip())
+    parts = [p for p in parts if p]
+    if len(parts) < 4 or not all(re.fullmatch(r"[0-7]{2,3}", p) and int(p, 8) < 256 for p in parts):
+        return None
+    return bytes(int(p, 8) for p in parts)
+
+
+def dec_bigint(s):
+    t = s.strip()
+    if not re.fullmatch(r"\d{12,}", t):
+        return None
+    n = int(t)
+    return n.to_bytes((n.bit_length() + 7) // 8, "big")
+
+
+def dec_morse(s):
+    t = s.strip()
+    if not re.fullmatch(r"[.\-/ \s|]+", t) or len(t) < 5:
+        return None
+    words = re.split(r"\s*[/|]\s*|\s{3,}", t)
+    out = " ".join("".join(MORSE.get(c, "?") for c in w.split()) for w in words)
+    return out.encode()
+
+
+def dec_url(s):
+    return urllib.parse.unquote_to_bytes(s) if "%" in s else None
+
+
+def dec_html(s):
+    return html.unescape(s).encode() if "&" in s and ";" in s else None
+
+
+def dec_rot13(s):
+    return codecs.encode(s, "rot13").encode() if re.search(r"[A-Za-z]", s) else None
+
+
+def dec_rot47(s):
+    return "".join(chr(33 + (ord(c) + 14) % 94) if 33 <= ord(c) <= 126 else c for c in s).encode()
+
+
+def dec_atbash(s):
+    def f(c):
+        if "a" <= c <= "z":
+            return chr(219 - ord(c))
+        if "A" <= c <= "Z":
+            return chr(155 - ord(c))
+        return c
+    return "".join(map(f, s)).encode()
+
+
+def dec_reverse(s):
+    return s[::-1].encode()
+
+
+def dec_uu(s):
+    if not s.lstrip().startswith("begin "):
+        return None
+    return codecs.decode(s.encode(), "uu")
+
+
+def dec_zlib(s_bytes: bytes):
+    import gzip
+    import zlib
+    if s_bytes[:2] == b"\x1f\x8b":
+        return gzip.decompress(s_bytes)
+    if s_bytes[:1] == b"\x78":
+        return zlib.decompress(s_bytes)
+    return None
+
+
+TEXT_DECODERS = [
+    ("base64", dec_base64), ("base32", dec_base32), ("base58", dec_base58), ("base85", dec_base85),
+    ("hex", dec_hex), ("binary", dec_binary), ("decimal", dec_decimal), ("octal", dec_octal),
+    ("bigint", dec_bigint), ("morse", dec_morse), ("url", dec_url), ("html", dec_html),
+    ("uu", dec_uu), ("rot13", dec_rot13), ("rot47", dec_rot47), ("atbash", dec_atbash),
+    ("reverse", dec_reverse),
+]
+# Transforms that never shrink the text: only applied once at the end of a chain.
+SYMMETRIC = {"rot13", "rot47", "atbash", "reverse"}
+
+
+def printable_ratio(b: bytes) -> float:
+    if not b:
+        return 0.0
+    good = sum(1 for x in b if 32 <= x < 127 or x in (9, 10, 13))
+    return good / len(b)
+
+
+def caesar_all(s: str):
+    for k in range(1, 26):
+        out = []
+        for c in s:
+            if "a" <= c <= "z":
+                out.append(chr((ord(c) - 97 + k) % 26 + 97))
+            elif "A" <= c <= "Z":
+                out.append(chr((ord(c) - 65 + k) % 26 + 65))
+            else:
+                out.append(c)
+        yield k, "".join(out)
+
+
+def xor_search(data: bytes, rx: re.Pattern[str]):
+    """Single-byte XOR, plus repeating-key XOR recovered from the known flag prefix."""
+    hits = []
+    if len(data) < 6 or len(data) > 2_000_000:
+        return hits
+    for k in range(1, 256):
+        dec = bytes(b ^ k for b in data)
+        for m in rx.finditer(dec.decode("latin-1")):
+            if plausible(m.group(0), rx):
+                hits.append((f"xor-byte(0x{k:02x})", m.group(0)))
+    prefix = flag_prefix(rx)
+    if prefix and len(prefix) >= 3 and len(data) <= 4096:
+        for off in range(0, len(data) - len(prefix) + 1):
+            ks = bytes(a ^ b for a, b in zip(data[off:off + len(prefix)], prefix))
+            for klen in range(1, len(prefix) + 1):
+                key = ks[:klen]
+                # key must repeat consistently over the known prefix
+                if any(ks[i] != key[i % klen] for i in range(len(ks))):
+                    continue
+                rot = (-off) % klen
+                key = key[rot:] + key[:rot]
+                dec = bytes(b ^ key[i % klen] for i, b in enumerate(data))
+                for m in rx.finditer(dec.decode("latin-1")):
+                    hits.append((f"xor-key({key.hex()})", m.group(0)))
+                break
+    return hits
+
+
+def decode_chain(text: str, rx: re.Pattern[str], depth: int = 6, budget: int = 3000):
+    """Breadth-first search over decoder chains. Returns list of (chain, flag) and best plaintexts."""
+    seen = {text}
+    frontier = [((), text)]
+    hits: list[tuple[str, str]] = []
+    readable: list[tuple[str, str]] = []
+    steps = 0
+    for _ in range(depth):
+        nxt = []
+        for chain, cur in frontier:
+            for m in rx.finditer(cur):
+                hits.append((" -> ".join(chain) or "plain", m.group(0)))
+            for name, fn in TEXT_DECODERS:
+                if chain and name in SYMMETRIC and chain[-1] in SYMMETRIC:
+                    continue
+                steps += 1
+                if steps > budget:
+                    break
+                try:
+                    out = fn(cur)
+                except Exception:
+                    out = None
+                if not out:
+                    continue
+                try:
+                    z = dec_zlib(out)
+                    if z:
+                        out, name = z, name + "+zlib"
+                except Exception:
+                    pass
+                if printable_ratio(out) < 0.85:
+                    for how, f in xor_search(out, rx):
+                        hits.append((" -> ".join(chain + (name, how)), f))
+                    continue
+                s = out.decode("utf-8", "replace").strip()
+                if not s or s in seen:
+                    continue
+                seen.add(s)
+                if name not in SYMMETRIC:
+                    readable.append((" -> ".join(chain + (name,)), s[:200]))
+                nxt.append((chain + (name,), s))
+        frontier = nxt
+        if not frontier or any(score(f) >= 10 for _, f in hits):
+            break
+    for k, c in caesar_all(text):
+        for m in rx.finditer(c):
+            if plausible(m.group(0), rx):
+                hits.append((f"caesar(+{k})", m.group(0)))
+    # de-duplicate, best-looking flags first
+    out, s = [], set()
+    for h in hits:
+        if h[1] not in s:
+            s.add(h[1])
+            out.append(h)
+    out.sort(key=lambda h: -score(h[1]))
+    return out, readable[:15]
+
+
+# ------------------------------------------------------------------- scan ---
+TOKEN_RX = re.compile(r"[A-Za-z0-9+/=_\-]{16,}|(?:[0-9a-fA-F]{2}[\s:]?){8,}|[01\s]{32,}")
+
+
+def scan_bytes(data: bytes, rx: re.Pattern[str], source: str, deep: bool = True):
+    found = []
+    variants = [("raw", data.decode("latin-1"))]
+    if data.count(b"\x00") > len(data) // 4:
+        try:
+            variants.append(("utf16le", data.decode("utf-16le", "ignore")))
+        except Exception:
+            pass
+    for label, text in variants:
+        for m in rx.finditer(text):
+            found.append({"source": source, "how": label, "flag": m.group(0)})
+        if label == "raw":
+            r = text[::-1]
+            for m in rx.finditer(r):
+                found.append({"source": source, "how": "reversed", "flag": m.group(0)})
+    if deep:
+        tokens = TOKEN_RX.findall(data.decode("latin-1"))[:400]
+        for tok in tokens:
+            hits, _ = decode_chain(tok.strip(), rx, depth=4, budget=200)
+            for chain, f in hits:
+                if chain != "plain":
+                    found.append({"source": source, "how": chain, "flag": f})
+    uniq, seen = [], set()
+    for f in found:
+        key = (f["flag"], f["how"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(f)
+    return uniq
+
+
+def iter_files(paths):
+    for p in paths:
+        p = Path(p)
+        if p.is_dir():
+            for q in sorted(p.rglob("*")):
+                if q.is_file() and ".git" not in q.parts:
+                    yield q
+        elif p.is_file():
+            yield p
+
+
+def default_scan_paths():
+    root = workspace_root() or Path.cwd()
+    return [str(root / d) for d in ("input", "work", "artifacts", "exploit", "scripts") if (root / d).exists()] or ["."]
+
+
+def record_candidate(flag: str, how: str, source: str):
+    root = workspace_root()
+    if not root:
+        return
+    path = root / "notes" / "flag-candidates.jsonl"
+    path.parent.mkdir(exist_ok=True)
+    with path.open("a") as fh:
+        fh.write(json.dumps({"time": time.strftime("%F %T"), "flag": flag, "how": how, "source": source}) + "\n")
+
+
+# ------------------------------------------------------------------- main ---
+def cmd_scan(a):
+    rx = flag_regex(a.format)
+    results = []
+    if a.paths == ["-"]:
+        results += scan_bytes(sys.stdin.buffer.read(), rx, "stdin", deep=not a.shallow)
+    else:
+        for f in iter_files(a.paths or default_scan_paths()):
+            try:
+                if f.stat().st_size > MAX_FILE:
+                    continue
+                results += scan_bytes(f.read_bytes(), rx, str(f), deep=not a.shallow)
+            except (OSError, PermissionError):
+                continue
+    if a.json:
+        print(json.dumps(results, indent=2))
+    else:
+        if not results:
+            print(f"no flag-like strings found (format: {rx.pattern})")
+        for r in results:
+            print(f"[FLAG?] {r['flag']}    <- {r['how']} in {r['source']}")
+    if a.record:
+        for r in results:
+            record_candidate(r["flag"], r["how"], r["source"])
+    return 0 if results else 1
+
+
+def cmd_decode(a):
+    rx = flag_regex(a.format)
+    text = sys.stdin.read() if a.text == "-" else a.text
+    hits, readable = decode_chain(text.strip(), rx, depth=a.depth, budget=20000)
+    data = text.encode("latin-1", "ignore")
+    if printable_ratio(data) < 0.85 or rx.pattern != GENERIC:
+        hits += [h for h in xor_search(data, rx) if h[1] not in {f for _, f in hits}]
+    if hits:
+        for chain, f in hits:
+            print(f"[FLAG?] {f}    <- {chain}")
+    else:
+        print(f"no flag found (format: {rx.pattern}). Readable decodings:")
+        for chain, s in readable:
+            print(f"  {chain:40s} {s!r}")
+    return 0 if hits else 1
+
+
+def cmd_verify(a):
+    rx = flag_regex(a.format)
+    flag = a.flag.strip()
+    ok = True
+    if not rx.fullmatch(flag):
+        print(f"[FAIL] '{flag}' does not match flag format {rx.pattern}")
+        ok = False
+    else:
+        print(f"[OK]   format matches {rx.pattern}")
+    suspicious = [w for w in ("example", "fake", "test", "placeholder", "redacted", "xxxx", "your_flag", "not_the_flag") if w in flag.lower()]
+    if suspicious:
+        print(f"[WARN] flag contains decoy-looking words: {', '.join(suspicious)}. Check it is not a dummy/local flag.")
+    if a.cmd:
+        try:
+            cp = subprocess.run(a.cmd, shell=True, capture_output=True, text=True, timeout=a.timeout)
+            out = (cp.stdout or "") + (cp.stderr or "")
+        except subprocess.TimeoutExpired as e:
+            out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+            print(f"[WARN] solver timed out after {a.timeout}s")
+        if flag in out:
+            print(f"[OK]   solver reproduced the flag: {a.cmd}")
+        else:
+            print(f"[FAIL] solver output does not contain the flag: {a.cmd}")
+            tail = out.strip().splitlines()[-10:]
+            print("       last output lines:\n       " + "\n       ".join(tail))
+            ok = False
+    else:
+        print("[WARN] no --cmd given: flag was not reproduced by a solver script")
+    root = workspace_root()
+    if ok and root:
+        (root / "notes").mkdir(exist_ok=True)
+        with (root / "notes" / "FLAG.txt").open("a") as fh:
+            fh.write(f"{time.strftime('%F %T')}  {flag}  verified_by={a.cmd or 'format-only'}\n")
+        print(f"[OK]   recorded in {root / 'notes' / 'FLAG.txt'}")
+    return 0 if ok else 1
+
+
+def cmd_format(a):
+    root = workspace_root() or Path.cwd()
+    if a.regex:
+        rx = normalize_format(a.regex)
+        re.compile(rx)
+        (root / ".ctf-flag-format").write_text(rx + "\n")
+        print(f"flag format for {root}: {rx}")
+    else:
+        print(flag_regex().pattern)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ctfflag", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--format", "-f", help="flag regex or prefix (e.g. picoCTF)")
+    sub = ap.add_subparsers(dest="cmd_name")
+    s = sub.add_parser("scan")
+    s.add_argument("paths", nargs="*")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--shallow", action="store_true", help="skip decoding embedded tokens")
+    s.add_argument("--record", action="store_true", help="append hits to notes/flag-candidates.jsonl")
+    d = sub.add_parser("decode")
+    d.add_argument("text")
+    d.add_argument("--depth", type=int, default=7)
+    v = sub.add_parser("verify")
+    v.add_argument("flag")
+    v.add_argument("--cmd", help="solver command that must print the flag")
+    v.add_argument("--timeout", type=int, default=120)
+    f = sub.add_parser("format")
+    f.add_argument("regex", nargs="?")
+    a = ap.parse_args(argv)
+    if not a.cmd_name:
+        ap.print_help()
+        return 2
+    return {"scan": cmd_scan, "decode": cmd_decode, "verify": cmd_verify, "format": cmd_format}[a.cmd_name](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

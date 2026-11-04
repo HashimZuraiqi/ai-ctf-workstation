@@ -1,14 +1,17 @@
 ---
 name: ctf-osint
-description: Run evidence-based OSINT for an authorized CTF without expanding beyond challenge scope.
+description: Conduct authorized, passive-first OSINT for CTF challenges with provenance.
 ---
 
-Use only for CTF clues and sources permitted by the competition.
+Use only for organizer-approved CTF OSINT targets and public sources permitted by the rules.
 
-- Define the exact question to answer before searching.
-- Record each source URL/title, access time, query and the fact it supports.
-- Separate confirmed facts from inference and low-confidence matches.
-- Prefer primary/public sources and corroborate important claims.
-- Use Playwright only when browser automation improves repeatability.
-- Do not pivot into unrelated private individuals, accounts or infrastructure.
-- Save enough provenance that a teammate can reproduce the finding.
+**Principles:** passive first; stay within the stated scope; record provenance (source URL + timestamp) for every finding in a table in `notes/analysis.md`. Do not touch unrelated people, accounts, or infrastructure.
+
+**Starting points by clue:**
+- **Image:** full EXIF (exiftool) - GPS, device, timestamps, software; reverse image search; landmark/sign/language geolocation; shadow and signage analysis.
+- **Username/handle:** Sherlock / Maigret across platforms; pivot to linked accounts, bios, old posts.
+- **Domain/host:** `osint_domain_snapshot` (passive WHOIS/DNS); certificate transparency (crt.sh); subdomains (subfinder/amass passive mode); Wayback Machine for historical pages.
+- **Person/org:** theHarvester for emails/subdomains; public records; social graph; metadata in published documents (metagoofil).
+- **File:** document metadata, embedded author/revision data.
+
+Use the `mcp-osint` profile; the team OSINT MCP blocks active/brute-force flags by design. Verify each claim against a second source before relying on it.
