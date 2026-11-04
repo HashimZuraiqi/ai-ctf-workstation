@@ -1,5 +1,20 @@
 # Competition-Day Cheat Sheet
 
+## Auto-triage, flags and autosolver
+
+```bash
+ctftriage --desc "challenge text"      # first pass -> notes/triage.md (run this first)
+ctfflag scan                           # find flags anywhere in the workspace
+ctfflag decode "<encoded text>"        # peel encoding layers
+ctfflag verify "<flag>" --cmd "python3 scripts/solve.py"   # confirm before submitting
+
+# Optional any-model autosolver (set the endpoint first):
+export CTFSOLVE_API_BASE=... CTFSOLVE_MODEL=...
+ctfsolve --desc "challenge text" --nc host:port
+```
+
+See docs/AGENT_TOOLS.md for details.
+
 ## Start a challenge
 
 ```bash

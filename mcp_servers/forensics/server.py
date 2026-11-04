@@ -61,9 +61,39 @@ def _run(argv: list[str], timeout: int = 60) -> dict[str, Any]:
     try:
         cp = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True, timeout=timeout, env=os.environ.copy())
         out = (cp.stdout or "") + (("\n[stderr]\n" + cp.stderr) if cp.stderr else "")
-        return {"argv": argv, "exit_code": cp.returncode, "output": out[:MAX_OUTPUT], "truncated": len(out) > MAX_OUTPUT}
+        return {"argv": argv, "exit_code": cp.returncode, **_summarize(out, argv[0] if argv else "run")}
     except subprocess.TimeoutExpired as e:
         return {"argv": argv, "timeout": True, "output": ((e.stdout or "") if isinstance(e.stdout, str) else "")[:MAX_OUTPUT]}
+
+
+def _summarize(out: str, source: str = "output") -> dict[str, Any]:
+    """Compact long tool output: keep head+tail, flag-like and interesting lines,
+    and save the full text to CTF_ROOT/artifacts/mcp/ for later grep. This keeps
+    small-context models from drowning in raw output."""
+    lines = out.splitlines()
+    if len(out) <= 6000 and len(lines) <= 120:
+        return {"output": out, "truncated": False}
+    import hashlib, re as _re, time as _time
+    saved = None
+    try:
+        d = ROOT / "artifacts" / "mcp"
+        d.mkdir(parents=True, exist_ok=True)
+        name = f"{_re.sub(r'[^A-Za-z0-9._-]','_',source)[:40]}-{hashlib.sha1(out.encode()).hexdigest()[:8]}.txt"
+        (d / name).write_text(out)
+        saved = str(d / name)
+    except Exception:
+        pass
+    pat = _re.compile(r"(flag|ctf|key|secret|password|error|fail|denied|0x[0-9a-f]+|\{[^}]{2,}\})", _re.I)
+    interesting = [l for l in lines if pat.search(l)][:40]
+    head = lines[:40]
+    tail = lines[-15:]
+    body = "\n".join(head)
+    if interesting:
+        body += "\n... [interesting lines] ...\n" + "\n".join(interesting)
+    body += "\n... [tail] ...\n" + "\n".join(tail)
+    return {"output": body[:MAX_OUTPUT], "truncated": True, "total_lines": len(lines),
+            "full_output_saved_to": saved,
+            "note": "Output summarized. grep the saved file for detail."}
 
 
 @mcp.tool()

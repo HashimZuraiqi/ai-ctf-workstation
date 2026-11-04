@@ -23,6 +23,9 @@ This repository packages the workstation we built and tested into one team-frien
 - Custom OSINT MCP with allowlisted passive-oriented discovery helpers
 - Docker and common Kali web/rev/pwn/forensics utilities
 - Shared AI skills for triage, reverse, pwn, web, crypto, forensics, OSINT, AI security, mobile, misc, and reporting
+- `ctftriage` for an automatic evidence-first first pass over every challenge
+- `ctfflag` to find, decode and verify flags (and stop made-up flags)
+- `ctfsolve`, a model-agnostic plan/act/verify autosolver that works with any OpenAI-compatible model, local or hosted
 - `ctfnew` for standardized challenge workspaces
 - `ctf-mcp` plus category profiles: `mcp-rev`, `mcp-pwn`, `mcp-web`, `mcp-forensics`, `mcp-crypto`, `mcp-osint`, `mcp-mobile`, `mcp-all`, `mcp-off`
 - `ghidra-ai` to launch Ghidra with Java 21 without changing Kali's global Java
@@ -151,6 +154,16 @@ Read [SECURITY.md](SECURITY.md) before sharing the workstation with the team.
 The original workstation was verified on Kali Rolling with Node 24, npm 11, Python 3.12, Ghidra 12.1.2, Java 21 for Ghidra, Codex, Antigravity, GDB MCP, Ghidra MCP, Playwright CLI/MCP and Docker. We also built/tested extended Forensics, Crypto and OSINT tool layers and custom MCP bridges; those are included here. Exact rolling-package/AI-CLI versions naturally change over time; Ghidra is pinned because the MCP integration was tested against it.
 
 See [docs/VERIFIED_BASELINE.md](docs/VERIFIED_BASELINE.md), [docs/COMPLETE_STACK.md](docs/COMPLETE_STACK.md), and [docs/STATUS.md](docs/STATUS.md).
+
+## Keep the workstation up to date
+
+Pull the latest agent tools, skills and MCP servers with one command:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/HashimZuraiqi/ai-ctf-workstation/main/scripts/update.sh)
+```
+
+Add `--full` to update the entire toolchain. See [docs/AGENT_TOOLS.md](docs/AGENT_TOOLS.md) for the new `ctftriage`, `ctfflag` and `ctfsolve` helpers.
 
 ## Publish this repo to your team's GitHub
 

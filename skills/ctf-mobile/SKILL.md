@@ -1,13 +1,16 @@
 ---
 name: ctf-mobile
-description: Analyze authorized mobile CTF applications with static-first Android workflows.
+description: Analyse authorized CTF mobile (APK/IPA) challenges.
 ---
 
-Use for authorized mobile CTF challenges.
+Use for authorized mobile challenges.
 
-- Hash/preserve the original APK/IPA and extract only into `work/`.
-- For Android, inspect manifest/components with Apktool and source/decompiled code with JADX.
-- Map exported components, intent/deep-link surfaces, network endpoints, native libraries and local storage/configuration.
-- Search for validation logic and success conditions before dynamic testing.
-- Use emulators/devices only as allowed by the challenge and never personal production accounts.
-- Verify interesting code paths with a minimal reproducible test.
+**Android (APK):**
+- Unpack: `apktool d` (resources/smali), `jadx -d` (Java source). Read `AndroidManifest.xml` for components, permissions, exported activities, and the main entry.
+- Look for hard-coded secrets in strings.xml, resources, assets/, and the code; check for native `.so` libraries (analyse in Ghidra).
+- Inspect custom crypto, API endpoints, certificate pinning, and any local check logic you can invert.
+- Dynamic (if in scope): run in an emulator, use Frida to hook methods and observe/patch behaviour.
+
+**iOS (IPA):** unzip, inspect the Mach-O (`rz-bin`, Ghidra), Info.plist, embedded resources and strings; look for hard-coded keys and endpoints.
+
+Reproduce the check in a small script where possible and record the exact file/method that held the answer. Use the `mcp-mobile` profile (Ghidra + GDB).
