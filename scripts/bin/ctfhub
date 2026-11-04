@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""ctfhub - an interactive terminal control panel for the whole workstation.
+
+One menu that shows your current model, MCP profile and challenge workspaces, and
+runs the tools (triage, flag scan/decode/verify, the autosolver, doctor, MCP
+profile switch, model switch) by number - so you don't have to remember commands.
+
+It is a thin front end over the same CLIs (ctfnew, ctftriage, ctfflag, ctfsolve,
+ctfmodel, ctf-mcp, ctfdoctor): every menu item runs the real command in your
+terminal and you see its live output. No network port is opened. Works over SSH.
+
+Usage:
+  ctfhub                 interactive menu
+  ctfhub --status        print a one-shot status summary and exit
+
+For authorized CTF/lab use. Standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CTF_HOME = Path(os.environ.get("CTF_HOME", str(Path.home() / "ctf")))
+BIN = Path(__file__).resolve().parent
+
+C = {"r": "\033[0m", "b": "\033[1m", "dim": "\033[2m", "cy": "\033[36m",
+     "gr": "\033[32m", "ye": "\033[33m", "rd": "\033[31m", "bl": "\033[34m"}
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    C = {k: "" for k in C}
+
+CATS = ["misc", "rev", "pwn", "web", "forensics", "crypto", "osint", "mobile", "ai-security"]
+PROFILES = ["off", "rev", "pwn", "web", "forensics", "crypto", "osint", "mobile", "all"]
+PROVIDERS = ["deepseek", "openrouter", "groq", "together", "fireworks",
+             "hyperbolic", "nebius", "openai", "ollama", "vllm", "lmstudio", "custom"]
+
+
+def tool(name: str) -> str:
+    local = BIN / name
+    return str(local) if local.exists() else name
+
+
+def have(name: str) -> bool:
+    return shutil.which(name) is not None or (BIN / name).exists()
+
+
+def quick(argv, timeout=20) -> str:
+    try:
+        cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return (cp.stdout or "") + (cp.stderr or "")
+    except Exception as e:  # noqa: BLE001
+        return f"(error: {e})"
+
+
+def run_live(argv, cwd=None) -> int:
+    """Run a command showing its output live in this terminal."""
+    print(f"{C['dim']}$ {' '.join(argv)}{C['r']}")
+    try:
+        return subprocess.run(argv, cwd=cwd).returncode
+    except KeyboardInterrupt:
+        print(f"\n{C['ye']}interrupted{C['r']}")
+        return 130
+    except Exception as e:  # noqa: BLE001
+        print(f"{C['rd']}error: {e}{C['r']}")
+        return 1
+
+
+def model_info() -> dict:
+    m = {}
+    if have("ctfmodel"):
+        for line in quick([sys.executable, tool("ctfmodel"), "show"]).splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                m[k.strip()] = v.strip()
+    return m
+
+
+def workspaces():
+    if not CTF_HOME.exists():
+        return []
+    out = []
+    for d in sorted(CTF_HOME.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if d.is_dir():
+            cat = (d / ".ctf-category").read_text().strip() if (d / ".ctf-category").exists() else "?"
+            flag = (d / "notes" / "FLAG.txt").exists()
+            out.append((d.name, cat, flag))
+    return out
+
+
+def ask(prompt, default=""):
+    try:
+        v = input(f"{C['cy']}{prompt}{C['r']}" + (f" [{default}]" if default else "") + ": ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    return v or default
+
+
+def choose(prompt, options):
+    for i, o in enumerate(options, 1):
+        print(f"  {C['b']}{i}{C['r']}) {o}")
+    v = ask(prompt)
+    if v.isdigit() and 1 <= int(v) <= len(options):
+        return options[int(v) - 1]
+    return v or None
+
+
+def banner():
+    print(f"\n{C['cy']}{C['b']}╔══════════════════════════════════════════╗{C['r']}")
+    print(f"{C['cy']}{C['b']}║            C T F   H U B                  ║{C['r']}")
+    print(f"{C['cy']}{C['b']}╚══════════════════════════════════════════╝{C['r']}")
+
+
+def status_block(state):
+    m = model_info()
+    ws = state.get("ws")
+    mcp_line = quick([tool("ctf-mcp"), "status"]).strip().splitlines()[:1] if have("ctf-mcp") else ["(ctf-mcp missing)"]
+    prov = m.get("CTFSOLVE_PROVIDER", "(not set)")
+    model = m.get("CTFSOLVE_MODEL", "(not set)")
+    key = "set" if m.get("CTFSOLVE_API_KEY") else "none"
+    print(f"{C['dim']}workspace:{C['r']} {C['b']}{ws or '(none selected)'}{C['r']}"
+          f"   {C['dim']}model:{C['r']} {C['gr']}{prov}/{model}{C['r']} {C['dim']}(key {key}){C['r']}"
+          f"   {C['dim']}mcp:{C['r']} {mcp_line[0] if mcp_line else ''}")
+
+
+def wspath(state) -> Path | None:
+    return (CTF_HOME / state["ws"]) if state.get("ws") else None
+
+
+def need_ws(state) -> bool:
+    if not state.get("ws"):
+        print(f"{C['ye']}Pick a workspace first (menu 1).{C['r']}")
+        return False
+    return True
+
+
+MENU = [
+    ("Select / create challenge", "select"),
+    ("Triage the challenge (ctftriage)", "triage"),
+    ("Scan for flags (ctfflag scan)", "scan"),
+    ("Decode a string (ctfflag decode)", "decode"),
+    ("Verify a flag (ctfflag verify)", "verify"),
+    ("Autosolve (ctfsolve)", "solve"),
+    ("Switch MCP profile (ctf-mcp)", "mcp"),
+    ("Configure model (ctfmodel)", "model"),
+    ("Open notes (triage/analysis)", "notes"),
+    ("Health check (ctfdoctor)", "doctor"),
+    ("Refresh status", "refresh"),
+    ("Quit", "quit"),
+]
+
+
+def do_select(state):
+    wl = workspaces()
+    print(f"\n{C['b']}Challenges in {CTF_HOME}:{C['r']}")
+    if wl:
+        for i, (n, cat, flag) in enumerate(wl, 1):
+            mark = f" {C['gr']}✓flag{C['r']}" if flag else ""
+            print(f"  {C['b']}{i}{C['r']}) {n} {C['dim']}· {cat}{C['r']}{mark}")
+    else:
+        print(f"  {C['dim']}(none yet){C['r']}")
+    print(f"  {C['b']}n{C['r']}) create a new challenge")
+    v = ask("pick number or 'n'")
+    if v == "n":
+        name = ask("challenge name")
+        if not name:
+            return
+        cat = choose("category", CATS) or "misc"
+        if run_live([tool("ctfnew"), name, cat]) == 0:
+            state["ws"] = name
+    elif v.isdigit() and 1 <= int(v) <= len(wl):
+        state["ws"] = wl[int(v) - 1][0]
+        print(f"{C['gr']}selected {state['ws']}{C['r']}")
+
+
+def challenge_ctx():
+    desc = ask("description (optional, paste challenge text)")
+    url = ask("target URL (optional)")
+    nc = ask("remote nc host port (optional)")
+    extra = []
+    if desc:
+        extra += ["--desc", desc]
+    if url:
+        extra += ["--url", url]
+    if nc:
+        extra += ["--nc", nc]
+    return extra
+
+
+def do_triage(state):
+    if not need_ws(state):
+        return
+    run_live([sys.executable, tool("ctftriage")] + challenge_ctx(), cwd=str(wspath(state)))
+    print(f"{C['dim']}Summary written to notes/triage.md{C['r']}")
+
+
+def do_scan(state):
+    if not need_ws(state):
+        return
+    run_live([sys.executable, tool("ctfflag"), "scan"], cwd=str(wspath(state)))
+
+
+def do_decode(state):
+    text = ask("text to decode")
+    if text:
+        run_live([sys.executable, tool("ctfflag"), "decode", text], cwd=str(wspath(state)) if state.get("ws") else None)
+
+
+def do_verify(state):
+    flag = ask("flag to verify")
+    if not flag:
+        return
+    cmd = ask("solver command that prints it (optional)")
+    argv = [sys.executable, tool("ctfflag"), "verify", flag]
+    if cmd:
+        argv += ["--cmd", cmd]
+    run_live(argv, cwd=str(wspath(state)) if state.get("ws") else None)
+
+
+def do_solve(state):
+    if not need_ws(state):
+        return
+    m = model_info()
+    if not m.get("CTFSOLVE_MODEL"):
+        print(f"{C['ye']}No model set. Use menu 8 (Configure model) first.{C['r']}")
+        return
+    steps = ask("max steps", "25")
+    argv = [sys.executable, tool("ctfsolve"), "--yes"]
+    if steps.isdigit():
+        argv += ["--steps", steps]
+    argv += challenge_ctx()
+    run_live(argv, cwd=str(wspath(state)))
+
+
+def do_mcp(state):
+    prof = choose("MCP profile", PROFILES)
+    if prof:
+        run_live([tool("ctf-mcp"), prof])
+
+
+def do_model(state):
+    print(f"{C['dim']}Current:{C['r']}")
+    run_live([sys.executable, tool("ctfmodel"), "show"])
+    print(f"\n{C['b']}a{C['r']}) set provider/model   {C['b']}k{C['r']}) set key   "
+          f"{C['b']}t{C['r']}) test   {C['b']}l{C['r']}) list providers")
+    v = ask("choice")
+    if v == "a":
+        prov = choose("provider", PROVIDERS)
+        if not prov:
+            return
+        model = ask("model name (blank = provider default)")
+        planner = ask("planner model (optional)")
+        argv = [sys.executable, tool("ctfmodel"), "use", prov]
+        if model:
+            argv.append(model)
+        if planner:
+            argv += ["--planner", planner]
+        run_live(argv)
+    elif v == "k":
+        key = ask("API key")
+        if key:
+            run_live([sys.executable, tool("ctfmodel"), "key", key])
+    elif v == "t":
+        run_live([sys.executable, tool("ctfmodel"), "test"])
+    elif v == "l":
+        run_live([sys.executable, tool("ctfmodel"), "list"])
+
+
+def do_notes(state):
+    if not need_ws(state):
+        return
+    base = wspath(state)
+    for rel in ("notes/triage.md", "notes/analysis.md", "notes/FLAG.txt"):
+        f = base / rel
+        if f.exists():
+            print(f"\n{C['b']}── {rel} ──{C['r']}")
+            print(f.read_text()[:8000])
+    print()
+
+
+def do_doctor(state):
+    run_live([tool("ctfdoctor")])
+
+
+ACTIONS = {"select": do_select, "triage": do_triage, "scan": do_scan, "decode": do_decode,
+           "verify": do_verify, "solve": do_solve, "mcp": do_mcp, "model": do_model,
+           "notes": do_notes, "doctor": do_doctor}
+
+
+def oneshot_status():
+    m = model_info()
+    print("CTF Hub status")
+    print(f"  ctf home : {CTF_HOME}")
+    print(f"  model    : {m.get('CTFSOLVE_PROVIDER','(not set)')}/{m.get('CTFSOLVE_MODEL','(not set)')} "
+          f"(key {'set' if m.get('CTFSOLVE_API_KEY') else 'none'})")
+    print(f"  tools    : " + ", ".join(t for t in ("ctfnew", "ctftriage", "ctfflag", "ctfsolve",
+                                                    "ctfmodel", "ctf-mcp", "ctfdoctor") if have(t)))
+    wl = workspaces()
+    print(f"  challenges ({len(wl)}):")
+    for n, cat, flag in wl[:20]:
+        print(f"    - {n} [{cat}]" + ("  ✓flag" if flag else ""))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ctfhub", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--status", action="store_true", help="print status and exit")
+    a = ap.parse_args(argv)
+    CTF_HOME.mkdir(parents=True, exist_ok=True)
+    if a.status:
+        oneshot_status()
+        return 0
+    state = {"ws": None}
+    # preselect the most recent workspace
+    wl = workspaces()
+    if wl:
+        state["ws"] = wl[0][0]
+    banner()
+    while True:
+        print()
+        status_block(state)
+        print(f"{C['dim']}{'─' * 46}{C['r']}")
+        for i, (label, _) in enumerate(MENU, 1):
+            print(f"  {C['b']}{i:>2}{C['r']}) {label}")
+        v = ask("choose")
+        if not v:
+            continue
+        if not v.isdigit() or not (1 <= int(v) <= len(MENU)):
+            print(f"{C['ye']}enter a number 1-{len(MENU)}{C['r']}")
+            continue
+        key = MENU[int(v) - 1][1]
+        if key == "quit":
+            print("bye")
+            return 0
+        if key == "refresh":
+            continue
+        try:
+            ACTIONS[key](state)
+        except KeyboardInterrupt:
+            print(f"\n{C['ye']}cancelled{C['r']}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

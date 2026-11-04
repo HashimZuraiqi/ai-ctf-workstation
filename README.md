@@ -26,6 +26,7 @@ This repository packages the workstation we built and tested into one team-frien
 - `ctftriage` for an automatic evidence-first first pass over every challenge
 - `ctfflag` to find, decode and verify flags (and stop made-up flags)
 - `ctfsolve`, a model-agnostic plan/act/verify autosolver, plus `ctfmodel` to point it at open-source models (OpenRouter, Together, Groq, DeepSeek, Ollama, ...) with one API key
+- `ctfhub`, an interactive terminal control panel over every tool below
 - `ctfnew` for standardized challenge workspaces
 - `ctf-mcp` plus category profiles: `mcp-rev`, `mcp-pwn`, `mcp-web`, `mcp-forensics`, `mcp-crypto`, `mcp-osint`, `mcp-mobile`, `mcp-all`, `mcp-off`
 - `ghidra-ai` to launch Ghidra with Java 21 without changing Kali's global Java

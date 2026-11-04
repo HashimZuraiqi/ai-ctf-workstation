@@ -3,7 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/scripts/lib/common.sh"
 ensure_local_path
-for f in ctfnew ctf-mcp ctfdoctor ghidra-ai ctftriage ctfflag ctfsolve ctfmodel; do install -m 0755 "$ROOT/scripts/bin/$f" "$HOME/.local/bin/$f"; done
+for f in ctfnew ctf-mcp ctfdoctor ghidra-ai ctftriage ctfflag ctfsolve ctfmodel ctfhub; do install -m 0755 "$ROOT/scripts/bin/$f" "$HOME/.local/bin/$f"; done
 mkdir -p "$HOME/.local/share/ctf-ai-workstation"
 rm -rf "$HOME/.local/share/ctf-ai-workstation/challenge-template"
 cp -a "$ROOT/templates/challenge" "$HOME/.local/share/ctf-ai-workstation/challenge-template"
