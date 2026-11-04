@@ -19,3 +19,6 @@ alias mcp-mobile='ctf-mcp mobile'
 alias mcp-all='ctf-mcp all'
 alias mcp-off='ctf-mcp off'
 alias mcp-status='ctf-mcp status'
+
+# ctfsolve model configuration (managed by `ctfmodel`)
+[[ -f "$HOME/.config/ctf-ai/ctfsolve.env" ]] && source "$HOME/.config/ctf-ai/ctfsolve.env"

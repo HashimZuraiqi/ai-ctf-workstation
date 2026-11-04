@@ -25,7 +25,7 @@ This repository packages the workstation we built and tested into one team-frien
 - Shared AI skills for triage, reverse, pwn, web, crypto, forensics, OSINT, AI security, mobile, misc, and reporting
 - `ctftriage` for an automatic evidence-first first pass over every challenge
 - `ctfflag` to find, decode and verify flags (and stop made-up flags)
-- `ctfsolve`, a model-agnostic plan/act/verify autosolver that works with any OpenAI-compatible model, local or hosted
+- `ctfsolve`, a model-agnostic plan/act/verify autosolver, plus `ctfmodel` to point it at open-source models (OpenRouter, Together, Groq, DeepSeek, Ollama, ...) with one API key
 - `ctfnew` for standardized challenge workspaces
 - `ctf-mcp` plus category profiles: `mcp-rev`, `mcp-pwn`, `mcp-web`, `mcp-forensics`, `mcp-crypto`, `mcp-osint`, `mcp-mobile`, `mcp-all`, `mcp-off`
 - `ghidra-ai` to launch Ghidra with Java 21 without changing Kali's global Java

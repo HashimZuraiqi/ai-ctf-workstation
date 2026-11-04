@@ -36,6 +36,29 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
+def _load_env_file():
+    """Load ~/.config/ctf-ai/ctfsolve.env (written by `ctfmodel`) without overriding
+    variables already set in the environment."""
+    import os
+    from pathlib import Path
+    f = Path(os.environ.get("CTFSOLVE_ENV_FILE", str(Path.home() / ".config/ctf-ai/ctfsolve.env")))
+    try:
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:]
+            if "=" in line:
+                k, _, v = line.partition("=")
+                k = k.strip(); v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k, v)
+    except OSError:
+        pass
+
+
+_load_env_file()
+
 
 def ctfflag_path() -> str:
     for c in (HERE / "ctfflag", Path.home() / ".local/bin/ctfflag"):
