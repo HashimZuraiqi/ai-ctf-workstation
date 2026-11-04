@@ -53,6 +53,7 @@ printf '\n-- CTF helpers --\n'
 if command -v ctfflag >/dev/null 2>&1 && ctfflag decode "ZmxhZ3t0ZXN0fQ==" 2>/dev/null | grep -q "flag{test}"; then ok "ctfflag decoder works"; else warn "ctfflag decode self-test failed"; fi
 if command -v ctftriage >/dev/null 2>&1; then ok "ctftriage installed"; else warn "ctftriage missing"; fi
 if command -v ctfmodel >/dev/null 2>&1; then ok "ctfmodel installed"; else warn "ctfmodel missing"; fi
+if command -v ctfhub >/dev/null 2>&1; then ok "ctfhub installed (run: ctfhub)"; else warn "ctfhub missing"; fi
 if command -v ctfsolve >/dev/null 2>&1; then
   if [[ -n "${CTFSOLVE_API_BASE:-}" && -n "${CTFSOLVE_MODEL:-}" ]]; then ok "ctfsolve installed (endpoint configured)"; else warn "ctfsolve installed (set CTFSOLVE_API_BASE + CTFSOLVE_MODEL to use it)"; fi
 else warn "ctfsolve missing"; fi

@@ -90,3 +90,20 @@ It:
 It never submits flags to an external service. Use it only for authorized challenges.
 Because the discipline lives in the harness, a cheap model used with a clear category
 profile often solves what it could not in a plain chat.
+
+## ctfhub - one menu for everything
+
+`ctfhub` is an interactive terminal control panel. It shows your current model,
+MCP profile and challenge workspaces, and runs every tool by number so you don't
+have to remember commands. No network port is opened; it just runs the real CLIs
+and shows their output, so it works over SSH too.
+
+```bash
+ctfhub            # open the menu
+ctfhub --status   # one-shot status summary
+```
+
+Menu: select/create challenge, triage, scan flags, decode, verify, autosolve,
+switch MCP profile, configure model, open notes, health check. It is a front end
+over `ctfnew`, `ctftriage`, `ctfflag`, `ctfsolve`, `ctfmodel`, `ctf-mcp` and
+`ctfdoctor` - nothing happens that you couldn't run by hand.
