@@ -107,3 +107,33 @@ Menu: select/create challenge, triage, scan flags, decode, verify, autosolve,
 switch MCP profile, configure model, open notes, health check. It is a front end
 over `ctfnew`, `ctftriage`, `ctfflag`, `ctfsolve`, `ctfmodel`, `ctf-mcp` and
 `ctfdoctor` - nothing happens that you couldn't run by hand.
+
+## ctfstudio - desktop GUI
+
+`ctfstudio` is the same idea as `ctfhub` in a window, for the Kali desktop
+(launch it from the app menu as **CTF Studio**, or run `ctfstudio`).
+
+- **Challenges**: every workspace in `~/ctf`, old and new. `+ New challenge` runs `ctfnew`.
+- **Challenge tab**: category, flag format, target URL, `nc` host/port and the
+  description. Saved to `.ctf-meta.json` and `notes/description.md`.
+- **Files & editor**: add files or folders to `input/` (sha256 logged to
+  `notes/input-sha256.txt`), delete, open with the system app, or edit text files
+  (solve scripts, notes) in the built-in editor.
+- **Prompt**: builds a task prompt from the challenge: authorized-CTF context,
+  category, in-scope targets, file list, triage summary and how to verify the flag.
+  Edit it freely; it is saved to `notes/prompt.md` and copied to the clipboard on launch.
+- **Agents**: launch Codex (`cx`), Claude Code (`cl`), Antigravity (`agy`) or
+  `ctfsolve` on the selected challenge, in a terminal window or in the background
+  with a log. Lists runs started here (stop, view log) and every
+  codex/claude/agy/ctfsolve process on the machine with its challenge.
+- **Tools**: triage, flag scan/decode/verify, MCP profile, model show/test, doctor,
+  with live output.
+
+`ctfstudio --check` prints what it found (agents, terminal, Tk) without opening a
+window. Agent commands and the terminal can be overridden in
+`~/.config/ctf-ai/ctfstudio.json`:
+
+```json
+{"terminal": "qterminal",
+ "agents": {"Antigravity (agy)": {"interactive": ["agy", "{prompt}"]}}}
+```

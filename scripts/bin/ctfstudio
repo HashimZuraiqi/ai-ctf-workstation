@@ -1,0 +1,1283 @@
+#!/usr/bin/env python3
+"""ctfstudio - desktop GUI for the AI CTF workstation.
+
+One window over everything the workstation already has:
+
+  * every challenge workspace in ~/ctf (old and new), with create / select
+  * challenge details (category, flag format, URL, nc target, description)
+  * files: add files to input/, remove, open, and a built-in text editor
+  * a prompt builder that writes a clear task prompt for an agent: it states the
+    authorized-CTF context, category, in-scope targets, files and how to verify
+  * agent launcher: Codex (cx), Claude Code (cl), Antigravity (agy) and ctfsolve,
+    in a terminal window or in the background with a log, pointed at the challenge
+  * an agents view: runs started here (with stop / log) plus every codex,
+    claude, agy or ctfsolve process already running on the machine
+  * one-click tools: ctftriage, ctfflag scan/decode/verify, ctf-mcp, ctfmodel,
+    ctfdoctor, with live output
+
+It only drives the existing CLIs; it opens no network port.
+Agent commands can be overridden in ~/.config/ctf-ai/ctfstudio.json, e.g.
+  {"agents": {"Antigravity (agy)": {"interactive": ["agy", "{prompt}"]}}}
+
+Usage:  ctfstudio            (needs a desktop session and python3-tk)
+        ctfstudio --check    print what it found and exit (no GUI)
+
+For authorized CTF/lab use. Standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import os
+import queue
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+HOME = Path.home()
+CTF_HOME = Path(os.environ.get("CTF_HOME", str(HOME / "ctf")))
+BIN = Path(__file__).resolve().parent
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(HOME / ".local" / "state"))) / "ctfstudio"
+RUNS_DIR = STATE_DIR / "runs"
+CONFIG_FILE = HOME / ".config" / "ctf-ai" / "ctfstudio.json"
+META_NAME = ".ctf-meta.json"
+
+CATS = ["misc", "rev", "pwn", "web", "forensics", "crypto", "osint", "mobile", "ai-security"]
+PROFILES = ["off", "rev", "pwn", "web", "forensics", "crypto", "osint", "mobile", "all"]
+SKIP_DIRS = {".git", ".agents", "node_modules", "__pycache__", ".venv"}
+AGENT_NAMES = {"codex", "claude", "agy", "antigravity", "ctfsolve"}
+
+# {prompt} is replaced by the prompt text; {desc} {url} {nc} by challenge fields.
+DEFAULT_AGENTS = {
+    "Codex (cx)": {"bin": "codex",
+                   "interactive": ["codex", "{prompt}"],
+                   "headless": ["codex", "exec", "{prompt}"]},
+    "Claude Code (cl)": {"bin": "claude",
+                         "interactive": ["claude", "{prompt}"],
+                         "headless": ["claude", "-p", "{prompt}"]},
+    "Antigravity (agy)": {"bin": "agy",
+                          "interactive": ["agy"],
+                          "headless": None},
+    "ctfsolve (any model)": {"bin": "ctfsolve",
+                             "interactive": ["ctfsolve", "--yes", "--desc", "{prompt}"],
+                             "headless": ["ctfsolve", "--yes", "--desc", "{prompt}"]},
+}
+
+
+# ----------------------------------------------------------------- helpers
+
+def agent_env() -> dict:
+    env = dict(os.environ)
+    extra = [HOME / ".local" / "bin", HOME / ".npm-global" / "bin", HOME / "bin",
+             HOME / ".antigravity" / "bin", HOME / ".cargo" / "bin", BIN]
+    parts = [str(p) for p in extra if p.is_dir()] + env.get("PATH", "/usr/bin:/bin").split(":")
+    seen, path = set(), []
+    for p in parts:
+        if p and p not in seen:
+            seen.add(p)
+            path.append(p)
+    env["PATH"] = ":".join(path)
+    return env
+
+
+ENV = agent_env()
+
+
+def which(name: str) -> str | None:
+    local = BIN / name
+    if local.exists():
+        return str(local)
+    return shutil.which(name, path=ENV["PATH"])
+
+
+def tool_argv(name: str, *args: str) -> list[str]:
+    """argv for one of our helpers; python helpers run with this interpreter."""
+    path = which(name) or name
+    try:
+        with open(path, "rb") as fh:
+            first = fh.readline()
+        if b"python" in first:
+            return [sys.executable, path, *args]
+        if b"bash" in first or first.rstrip().endswith(b"/sh"):
+            return ["bash", path, *args]
+    except OSError:
+        pass
+    return [path, *args]
+
+
+def load_config() -> dict:
+    agents = json.loads(json.dumps(DEFAULT_AGENTS))
+    cfg = {"terminal": os.environ.get("CTFSTUDIO_TERMINAL", "")}
+    if CONFIG_FILE.exists():
+        try:
+            user = json.loads(CONFIG_FILE.read_text())
+            for k, v in (user.get("agents") or {}).items():
+                agents.setdefault(k, {}).update(v)
+            if user.get("terminal"):
+                cfg["terminal"] = user["terminal"]
+        except Exception as e:  # noqa: BLE001
+            print(f"ctfstudio: ignoring bad {CONFIG_FILE}: {e}", file=sys.stderr)
+    cfg["agents"] = agents
+    return cfg
+
+
+def find_terminal(preferred: str = "") -> list[str] | None:
+    """Return the argv prefix that runs one executable in a new terminal window."""
+    names = ([preferred] if preferred else []) + [
+        "x-terminal-emulator", "qterminal", "xfce4-terminal", "gnome-terminal",
+        "konsole", "mate-terminal", "terminator", "alacritty", "kitty", "xterm"]
+    for n in names:
+        p = shutil.which(n, path=ENV["PATH"])
+        if not p:
+            continue
+        real = os.path.basename(os.path.realpath(p))
+        if "gnome-terminal" in real or "gnome-terminal" in n:
+            return [p, "--"]
+        if real.startswith("kitty"):
+            return [p]
+        return [p, "-e"]
+    return None
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def human(n: int) -> str:
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}T"
+
+
+def xdg_open(path) -> None:
+    opener = shutil.which("xdg-open") or shutil.which("open")
+    if opener:
+        subprocess.Popen([opener, str(path)], env=ENV, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            state = fh.read().rsplit(")", 1)[1].split()[0]
+        return state != "Z"
+    except (OSError, IndexError):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+def descendants(pid: int) -> list[int]:
+    children: dict[int, list[int]] = {}
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            ppid = int((d / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(int(d.name))
+    out, stack = [], [pid]
+    while stack:
+        for c in children.get(stack.pop(), []):
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+def stop_tree(pid: int) -> None:
+    for p in reversed(descendants(pid)):
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def scan_agent_processes() -> list[dict]:
+    """Every codex/claude/agy/ctfsolve process on the machine (any launcher)."""
+    out = []
+    me = os.getpid()
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) == me:
+            continue
+        try:
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+            argv = [a.decode(errors="replace") for a in argv if a]
+        except OSError:
+            continue
+        if not argv:
+            continue
+        name = None
+        for a in argv[:3]:
+            base = os.path.basename(a)
+            if base in AGENT_NAMES:
+                name = base
+                break
+            if base.startswith("python") or base in ("node", "bun", "bash", "sh", "env"):
+                continue
+            break
+        if not name:
+            continue
+        try:
+            cwd = os.readlink(d / "cwd")
+        except OSError:
+            cwd = "?"
+        chal = ""
+        try:
+            rel = Path(cwd).resolve().relative_to(CTF_HOME.resolve())
+            chal = rel.parts[0] if rel.parts else ""
+        except (ValueError, OSError):
+            pass
+        try:
+            started = time.time() - (time.monotonic() - _proc_start(d))
+        except Exception:  # noqa: BLE001
+            started = 0
+        out.append({"pid": int(d.name), "name": name, "cwd": cwd, "challenge": chal,
+                    "started": started, "cmd": " ".join(argv)[:200]})
+    # hide child processes of an agent we already listed (node workers etc.)
+    pids = {p["pid"] for p in out}
+    keep = []
+    for p in out:
+        try:
+            ppid = int(Path(f"/proc/{p['pid']}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            ppid = 0
+        if ppid not in pids:
+            keep.append(p)
+    return sorted(keep, key=lambda p: p["pid"])
+
+
+def _proc_start(d: Path) -> float:
+    ticks = int((d / "stat").read_text().rsplit(")", 1)[1].split()[19])
+    return ticks / os.sysconf("SC_CLK_TCK")
+
+
+# ----------------------------------------------------------- workspaces
+
+class Challenge:
+    def __init__(self, path: Path):
+        self.path = path
+        self.name = path.name
+
+    @property
+    def meta_file(self) -> Path:
+        return self.path / META_NAME
+
+    def meta(self) -> dict:
+        m = {"category": "", "flag_format": "", "url": "", "nc": "", "description": ""}
+        if self.meta_file.exists():
+            try:
+                m.update(json.loads(self.meta_file.read_text()))
+            except Exception:  # noqa: BLE001
+                pass
+        if not m["category"]:
+            cf = self.path / ".ctf-category"
+            m["category"] = cf.read_text().strip() if cf.exists() else "misc"
+        if not m["description"]:
+            d = self.path / "notes" / "description.md"
+            if d.exists():
+                m["description"] = d.read_text(errors="replace")
+        return m
+
+    def save_meta(self, m: dict) -> None:
+        self.meta_file.write_text(json.dumps(m, indent=2))
+        (self.path / ".ctf-category").write_text(m.get("category", "misc") + "\n")
+        (self.path / "notes").mkdir(exist_ok=True)
+        (self.path / "notes" / "description.md").write_text(m.get("description", ""))
+
+    def flag(self) -> str:
+        f = self.path / "notes" / "FLAG.txt"
+        return f.read_text(errors="replace").strip() if f.exists() else ""
+
+    def inputs(self) -> list[Path]:
+        d = self.path / "input"
+        if not d.is_dir():
+            return []
+        return sorted(p for p in d.rglob("*") if p.is_file())
+
+
+def list_challenges() -> list[Challenge]:
+    if not CTF_HOME.is_dir():
+        return []
+    dirs = [d for d in CTF_HOME.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [Challenge(d) for d in dirs]
+
+
+def build_prompt(ch: Challenge, extra: str = "") -> str:
+    m = ch.meta()
+    cat = m.get("category") or "misc"
+    lines = [
+        "You are helping me solve a challenge in an authorized Capture The Flag (CTF) "
+        "competition that I am registered for. The files and targets below were provided "
+        "by the CTF organizers for this event, and solving the challenge is the intended "
+        "activity.",
+        "",
+        f"Challenge: {ch.name}",
+        f"Category: {cat}",
+        f"Flag format: {m.get('flag_format') or 'unknown (look for something like CTF{...})'}",
+        f"Workspace: {ch.path}",
+    ]
+    desc = (m.get("description") or "").strip()
+    if desc:
+        lines += ["", "Challenge description (from the organizers):", desc]
+    files = ch.inputs()
+    if files:
+        lines += ["", "Files provided (in ./input/):"]
+        for f in files[:40]:
+            try:
+                lines.append(f"- {f.relative_to(ch.path)} ({human(f.stat().st_size)})")
+            except OSError:
+                pass
+        if len(files) > 40:
+            lines.append(f"- ... and {len(files) - 40} more")
+    targets = []
+    if m.get("url"):
+        targets.append(f"- Web: {m['url']}")
+    if m.get("nc"):
+        targets.append(f"- Remote service: nc {m['nc']}")
+    lines += ["", "In-scope targets:"]
+    lines += targets or ["- Only the local files above (no remote target)."]
+    lines.append("Only interact with the targets listed here. Do not scan or attack anything else.")
+    triage = ch.path / "notes" / "triage.md"
+    if triage.exists():
+        txt = triage.read_text(errors="replace").strip()
+        if txt:
+            lines += ["", "Automatic triage summary (notes/triage.md, truncated):", txt[:2500]]
+    lines += [
+        "",
+        "How to work:",
+        f"1. Read AGENTS.md / CLAUDE.md in this workspace and follow the ctf-{cat} playbook skill if it is available.",
+        "2. If notes/triage.md is missing, run `ctftriage` first and read its output.",
+        "3. Keep scratch work in ./work and put solve scripts in ./exploit (e.g. exploit/solve.py).",
+        "4. Record findings and dead ends in notes/analysis.md as you go.",
+        "5. Verify a candidate flag with `ctfflag verify '<flag>' --cmd '<solver command>'`, "
+        "then write it to notes/FLAG.txt.",
+        "6. Finish with a short explanation of the solution path.",
+    ]
+    if extra.strip():
+        lines += ["", "Extra notes from me:", extra.strip()]
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------ runs
+
+def _fill(argv: list[str], subs: dict) -> list[str]:
+    out = []
+    for a in argv:
+        for k, v in subs.items():
+            a = a.replace("{" + k + "}", v)
+        out.append(a)
+    return out
+
+
+def start_run(cfg: dict, agent: str, ch: Challenge, prompt: str, mode: str) -> dict:
+    spec = cfg["agents"][agent]
+    tmpl = spec.get("headless") if mode == "background" else spec.get("interactive")
+    if not tmpl:
+        raise RuntimeError(f"{agent} has no {mode} command configured "
+                           f"(set it in {CONFIG_FILE}).")
+    exe = which(tmpl[0])
+    if not exe:
+        raise RuntimeError(f"'{tmpl[0]}' was not found on PATH. Install it or fix {CONFIG_FILE}.")
+    m = ch.meta()
+    argv = _fill(tmpl, {"prompt": prompt, "desc": m.get("description", ""),
+                        "url": m.get("url", ""), "nc": m.get("nc", "")})
+    argv = tool_argv(tmpl[0], *argv[1:]) if tmpl[0] in ("ctfsolve",) else [exe, *argv[1:]]
+    if tmpl[0] == "ctfsolve":
+        if m.get("url"):
+            argv += ["--url", m["url"]]
+        if m.get("nc"):
+            argv += ["--nc", m["nc"]]
+
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    rid = _dt.datetime.now().strftime("%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    script, pidf, rcf, log = (RUNS_DIR / f"{rid}.sh", RUNS_DIR / f"{rid}.pid",
+                              RUNS_DIR / f"{rid}.rc", RUNS_DIR / f"{rid}.log")
+    (ch.path / "notes").mkdir(exist_ok=True)
+    (ch.path / "notes" / "prompt.md").write_text(prompt)
+    cmd = " ".join(shlex.quote(a) for a in argv)
+    body = [
+        "#!/usr/bin/env bash",
+        f"export PATH={shlex.quote(ENV['PATH'])}",
+        f"[[ -f \"$HOME/.config/ctf-ai/ctfsolve.env\" ]] && source \"$HOME/.config/ctf-ai/ctfsolve.env\"",
+        f"cd {shlex.quote(str(ch.path))} || exit 1",
+        f"echo $$ > {shlex.quote(str(pidf))}",
+    ]
+    if mode == "background":
+        body += [f"{cmd} > {shlex.quote(str(log))} 2>&1 < /dev/null",
+                 f"echo $? > {shlex.quote(str(rcf))}"]
+    else:
+        body += [
+            f"printf '\\033[1;36m== ctfstudio: {agent} on {ch.name} ==\\033[0m\\n'",
+            "echo 'Prompt saved to notes/prompt.md (also copied to the clipboard).'",
+            "echo",
+            cmd,
+            "rc=$?",
+            f"echo $rc > {shlex.quote(str(rcf))}",
+            "echo; echo \"[agent exited with code $rc] press Enter to close\"; read -r _",
+        ]
+    script.write_text("\n".join(body) + "\n")
+    script.chmod(0o700)
+
+    if mode == "background":
+        subprocess.Popen(["bash", str(script)], env=ENV, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    else:
+        term = find_terminal(cfg.get("terminal", ""))
+        if not term:
+            raise RuntimeError("No terminal emulator found (tried x-terminal-emulator, qterminal, "
+                               "xfce4-terminal, gnome-terminal, konsole, xterm).")
+        subprocess.Popen(term + [str(script)], env=ENV, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    rec = {"id": rid, "agent": agent, "challenge": ch.name, "cwd": str(ch.path), "mode": mode,
+           "started": time.time(), "cmd": cmd[:300], "log": str(log) if mode == "background" else ""}
+    (RUNS_DIR / f"{rid}.json").write_text(json.dumps(rec, indent=2))
+    return rec
+
+
+def run_status(rec: dict) -> tuple[str, int | None]:
+    rid = rec["id"]
+    rcf, pidf = RUNS_DIR / f"{rid}.rc", RUNS_DIR / f"{rid}.pid"
+    pid = None
+    if pidf.exists():
+        try:
+            pid = int(pidf.read_text().strip())
+        except ValueError:
+            pid = None
+    if rcf.exists():
+        return f"exited ({rcf.read_text().strip()})", pid
+    if pid is None:
+        return ("starting" if time.time() - rec.get("started", 0) < 20 else "never started"), None
+    return ("running" if pid_alive(pid) else "stopped"), pid
+
+
+def list_runs() -> list[dict]:
+    if not RUNS_DIR.is_dir():
+        return []
+    out = []
+    for f in RUNS_DIR.glob("*.json"):
+        try:
+            out.append(json.loads(f.read_text()))
+        except Exception:  # noqa: BLE001
+            pass
+    return sorted(out, key=lambda r: r.get("started", 0), reverse=True)
+
+
+def forget_run(rid: str) -> None:
+    for ext in ("json", "sh", "pid", "rc", "log"):
+        try:
+            (RUNS_DIR / f"{rid}.{ext}").unlink()
+        except OSError:
+            pass
+
+
+# -------------------------------------------------------------------- GUI
+
+def run_gui(cfg: dict) -> int:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, simpledialog, ttk
+    from tkinter.scrolledtext import ScrolledText
+
+    root = tk.Tk()
+    root.title("CTF Studio")
+    root.geometry("1280x800")
+    root.minsize(980, 600)
+    style = ttk.Style(root)
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+    style.configure("Treeview", rowheight=24)
+    style.configure("Big.TButton", padding=(10, 6))
+    mono = ("DejaVu Sans Mono", 10)
+
+    state = {"ch": None, "edit_path": None}
+    out_q: queue.Queue = queue.Queue()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    CTF_HOME.mkdir(parents=True, exist_ok=True)
+    last_file = STATE_DIR / "last.json"
+
+    status = tk.StringVar(value="ready")
+
+    def say(msg: str) -> None:
+        status.set(msg)
+
+    def cur() -> Challenge | None:
+        return state["ch"]
+
+    def need_ch() -> Challenge | None:
+        if not cur():
+            messagebox.showinfo("CTF Studio", "Select or create a challenge first.")
+        return cur()
+
+    # ---------- top bar
+    top = ttk.Frame(root, padding=(8, 6))
+    top.pack(fill="x")
+    ttk.Label(top, text="CTF Studio", font=("TkDefaultFont", 14, "bold")).pack(side="left")
+
+    def refresh_info():
+        bits = []
+        for n in ("codex", "claude", "agy"):
+            bits.append(f"{n}: {'yes' if which(n) else 'missing'}")
+        term = find_terminal(cfg.get("terminal", ""))
+        bits.append(f"terminal: {os.path.basename(term[0]) if term else 'none'}")
+        info.set("   ".join(bits))
+
+    quick = ttk.Frame(top)
+    quick.pack(side="right")
+    info = tk.StringVar()
+    ttk.Label(top, textvariable=info, foreground="#555").pack(side="left", padx=16)
+
+    # ---------- panes
+    pw = ttk.PanedWindow(root, orient="horizontal")
+    pw.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+
+    left = ttk.Frame(pw, padding=4)
+    pw.add(left, weight=1)
+    ttk.Label(left, text="Challenges (all in ~/ctf)", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+    chal_tree = ttk.Treeview(left, columns=("cat", "flag"), show="tree headings", height=20)
+    chal_tree.heading("#0", text="name")
+    chal_tree.heading("cat", text="category")
+    chal_tree.heading("flag", text="flag")
+    chal_tree.column("#0", width=170)
+    chal_tree.column("cat", width=80, anchor="w")
+    chal_tree.column("flag", width=40, anchor="center")
+    chal_tree.pack(fill="both", expand=True, pady=4)
+    lb = ttk.Frame(left)
+    lb.pack(fill="x")
+
+    right = ttk.Frame(pw)
+    pw.add(right, weight=4)
+    nb = ttk.Notebook(right)
+    nb.pack(fill="both", expand=True)
+
+    def tab(title):
+        f = ttk.Frame(nb, padding=8)
+        nb.add(f, text=title)
+        return f
+
+    t_info, t_files, t_prompt, t_agents, t_tools = (tab("Challenge"), tab("Files & editor"),
+                                                    tab("Prompt"), tab("Agents"), tab("Tools"))
+
+    ttk.Label(root, textvariable=status, relief="sunken", anchor="w", padding=(6, 2)).pack(fill="x", side="bottom")
+
+    # ================================================== challenge tab
+    fields = {}
+    form = ttk.Frame(t_info)
+    form.pack(fill="x")
+    title_var = tk.StringVar(value="(no challenge selected)")
+    ttk.Label(form, textvariable=title_var, font=("TkDefaultFont", 13, "bold")).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+    ttk.Label(form, text="Category").grid(row=1, column=0, sticky="w")
+    fields["category"] = tk.StringVar()
+    ttk.Combobox(form, textvariable=fields["category"], values=CATS, width=16).grid(row=1, column=1, sticky="w", padx=4)
+    ttk.Label(form, text="Flag format").grid(row=1, column=2, sticky="w")
+    fields["flag_format"] = tk.StringVar()
+    ttk.Entry(form, textvariable=fields["flag_format"], width=30).grid(row=1, column=3, sticky="we", padx=4)
+    ttk.Label(form, text="Target URL").grid(row=2, column=0, sticky="w", pady=4)
+    fields["url"] = tk.StringVar()
+    ttk.Entry(form, textvariable=fields["url"], width=40).grid(row=2, column=1, sticky="we", padx=4)
+    ttk.Label(form, text="nc host port").grid(row=2, column=2, sticky="w")
+    fields["nc"] = tk.StringVar()
+    ttk.Entry(form, textvariable=fields["nc"], width=30).grid(row=2, column=3, sticky="we", padx=4)
+    form.columnconfigure(1, weight=1)
+    form.columnconfigure(3, weight=1)
+    ttk.Label(t_info, text="Description (paste the challenge text)").pack(anchor="w", pady=(8, 2))
+    desc_txt = ScrolledText(t_info, height=10, wrap="word", font=mono, undo=True)
+    desc_txt.pack(fill="both", expand=True)
+    flag_var = tk.StringVar()
+    ttk.Label(t_info, textvariable=flag_var, foreground="#0a7a0a", font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=4)
+    ib = ttk.Frame(t_info)
+    ib.pack(fill="x")
+
+    def save_meta(quiet=False):
+        ch = need_ch()
+        if not ch:
+            return
+        m = ch.meta()
+        for k, v in fields.items():
+            m[k] = v.get().strip()
+        m["description"] = desc_txt.get("1.0", "end").rstrip() + "\n"
+        ch.save_meta(m)
+        if not quiet:
+            say(f"saved details for {ch.name}")
+        load_challenges(keep=ch.name)
+
+    ttk.Button(ib, text="Save details", style="Big.TButton", command=save_meta).pack(side="left")
+    ttk.Button(ib, text="Open folder", command=lambda: cur() and xdg_open(cur().path)).pack(side="left", padx=4)
+    ttk.Button(ib, text="Terminal here", command=lambda: open_terminal_here()).pack(side="left", padx=4)
+
+    def set_flag():
+        ch = need_ch()
+        if not ch:
+            return
+        v = simpledialog.askstring("Flag", "Flag for this challenge:", initialvalue=ch.flag(), parent=root)
+        if v is not None:
+            (ch.path / "notes").mkdir(exist_ok=True)
+            (ch.path / "notes" / "FLAG.txt").write_text(v.strip() + "\n")
+            show_challenge(ch)
+            load_challenges(keep=ch.name)
+
+    ttk.Button(ib, text="Set flag…", command=set_flag).pack(side="left", padx=4)
+
+    # ================================================== files tab
+    fpw = ttk.PanedWindow(t_files, orient="horizontal")
+    fpw.pack(fill="both", expand=True)
+    fl = ttk.Frame(fpw)
+    fpw.add(fl, weight=1)
+    file_tree = ttk.Treeview(fl, columns=("size",), show="tree headings")
+    file_tree.heading("#0", text="workspace files")
+    file_tree.heading("size", text="size")
+    file_tree.column("size", width=70, anchor="e")
+    file_tree.pack(fill="both", expand=True)
+    fb = ttk.Frame(fl)
+    fb.pack(fill="x", pady=4)
+    fr = ttk.Frame(fpw)
+    fpw.add(fr, weight=2)
+    edit_lbl = tk.StringVar(value="(open a text file from the list)")
+    ttk.Label(fr, textvariable=edit_lbl).pack(anchor="w")
+    editor = ScrolledText(fr, wrap="none", font=mono, undo=True)
+    editor.pack(fill="both", expand=True)
+    eb = ttk.Frame(fr)
+    eb.pack(fill="x", pady=4)
+
+    def load_files():
+        file_tree.delete(*file_tree.get_children())
+        ch = cur()
+        if not ch:
+            return
+
+        def add(parent, d: Path, depth=0):
+            try:
+                entries = sorted(d.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            except OSError:
+                return
+            for p in entries:
+                if p.name in SKIP_DIRS:
+                    continue
+                if p.is_dir() and not p.is_symlink():
+                    node = file_tree.insert(parent, "end", iid=str(p), text=p.name + "/",
+                                            open=(p.name == "input" or depth == 0 and p.name in ("notes", "exploit")))
+                    if depth < 6:
+                        add(node, p, depth + 1)
+                else:
+                    try:
+                        size = human(p.stat().st_size)
+                    except OSError:
+                        size = "?"
+                    file_tree.insert(parent, "end", iid=str(p), text=p.name, values=(size,))
+        add("", ch.path)
+
+    def sel_file() -> Path | None:
+        s = file_tree.selection()
+        return Path(s[0]) if s else None
+
+    def open_in_editor(p: Path):
+        try:
+            data = p.read_bytes()
+        except OSError as e:
+            messagebox.showerror("Open", str(e))
+            return
+        if b"\0" in data[:8192] or len(data) > 5_000_000:
+            if messagebox.askyesno("Binary file", f"{p.name} looks binary or is large.\nOpen it with the system app instead?"):
+                xdg_open(p)
+            return
+        editor.delete("1.0", "end")
+        editor.insert("1.0", data.decode(errors="replace"))
+        editor.edit_reset()
+        state["edit_path"] = p
+        edit_lbl.set(str(p))
+        nb.select(t_files)
+
+    def save_editor():
+        p = state["edit_path"]
+        if not p:
+            messagebox.showinfo("Save", "Open or create a file first.")
+            return
+        p.write_text(editor.get("1.0", "end-1c"))
+        say(f"saved {p}")
+        load_files()
+
+    def new_file():
+        ch = need_ch()
+        if not ch:
+            return
+        rel = simpledialog.askstring("New file", "Path inside the workspace (e.g. exploit/solve.py):", parent=root)
+        if not rel:
+            return
+        p = (ch.path / rel).resolve()
+        if ch.path.resolve() not in p.parents:
+            messagebox.showerror("New file", "Path must stay inside the workspace.")
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_text("")
+        load_files()
+        open_in_editor(p)
+
+    def add_files(folder=False):
+        ch = need_ch()
+        if not ch:
+            return
+        if folder:
+            d = filedialog.askdirectory(title="Folder to copy into input/")
+            srcs = [Path(d)] if d else []
+        else:
+            srcs = [Path(s) for s in filedialog.askopenfilenames(title="Files to add to input/")]
+        if not srcs:
+            return
+        dest = ch.path / "input"
+        dest.mkdir(exist_ok=True)
+        lines = []
+        for s in srcs:
+            t = dest / s.name
+            if s.is_dir():
+                shutil.copytree(s, t, dirs_exist_ok=True)
+                copied = [x for x in t.rglob("*") if x.is_file()]
+            else:
+                shutil.copy2(s, t)
+                copied = [t]
+            for c in copied:
+                lines.append(f"{sha256(c)}  {c.relative_to(ch.path)}")
+        (ch.path / "notes").mkdir(exist_ok=True)
+        with open(ch.path / "notes" / "input-sha256.txt", "a") as fh:
+            fh.write("\n".join(lines) + "\n")
+        say(f"added {len(lines)} file(s) to {ch.name}/input")
+        load_files()
+
+    def remove_file():
+        p = sel_file()
+        ch = cur()
+        if not p or not ch:
+            return
+        if not messagebox.askyesno("Delete", f"Delete {p.relative_to(ch.path)}?"):
+            return
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+        load_files()
+
+    def on_file_open(_e=None):
+        p = sel_file()
+        if p and p.is_file():
+            open_in_editor(p)
+
+    file_tree.bind("<Double-1>", on_file_open)
+    ttk.Button(fb, text="Add files…", command=add_files).pack(side="left")
+    ttk.Button(fb, text="Add folder…", command=lambda: add_files(True)).pack(side="left", padx=3)
+    ttk.Button(fb, text="Open", command=on_file_open).pack(side="left", padx=3)
+    ttk.Button(fb, text="System app", command=lambda: sel_file() and xdg_open(sel_file())).pack(side="left", padx=3)
+    ttk.Button(fb, text="Delete", command=remove_file).pack(side="left", padx=3)
+    ttk.Button(fb, text="↻", width=3, command=load_files).pack(side="right")
+    ttk.Button(eb, text="Save (Ctrl+S)", command=save_editor).pack(side="left")
+    ttk.Button(eb, text="New file…", command=new_file).pack(side="left", padx=4)
+    ttk.Button(eb, text="Reload", command=lambda: state["edit_path"] and open_in_editor(state["edit_path"])).pack(side="left")
+    editor.bind("<Control-s>", lambda e: (save_editor(), "break")[1])
+
+    # ================================================== prompt tab
+    ttk.Label(t_prompt, text="Task prompt for the agent. It is built from the challenge details, "
+                              "files and triage notes; edit it freely before launching.",
+              wraplength=900).pack(anchor="w")
+    ttk.Label(t_prompt, text="Extra notes to include (hints, what you already tried):").pack(anchor="w", pady=(6, 0))
+    extra_txt = tk.Text(t_prompt, height=3, wrap="word", font=mono)
+    extra_txt.pack(fill="x")
+    prompt_txt = ScrolledText(t_prompt, wrap="word", font=mono, undo=True)
+    prompt_txt.pack(fill="both", expand=True, pady=6)
+    pb = ttk.Frame(t_prompt)
+    pb.pack(fill="x")
+
+    def regen_prompt():
+        ch = cur()
+        prompt_txt.delete("1.0", "end")
+        if ch:
+            prompt_txt.insert("1.0", build_prompt(ch, extra_txt.get("1.0", "end")))
+
+    def prompt_text() -> str:
+        t = prompt_txt.get("1.0", "end").strip()
+        if not t and cur():
+            regen_prompt()
+            t = prompt_txt.get("1.0", "end").strip()
+        return t + "\n"
+
+    def copy_prompt():
+        root.clipboard_clear()
+        root.clipboard_append(prompt_text())
+        say("prompt copied to clipboard")
+
+    def save_prompt():
+        ch = need_ch()
+        if ch:
+            (ch.path / "notes").mkdir(exist_ok=True)
+            (ch.path / "notes" / "prompt.md").write_text(prompt_text())
+            say("saved notes/prompt.md")
+
+    ttk.Button(pb, text="Regenerate", command=lambda: (save_meta(quiet=True), regen_prompt())).pack(side="left")
+    ttk.Button(pb, text="Copy", command=copy_prompt).pack(side="left", padx=4)
+    ttk.Button(pb, text="Save to notes/prompt.md", command=save_prompt).pack(side="left")
+
+    # ================================================== agents tab
+    launch = ttk.LabelFrame(t_agents, text="Launch an agent on the selected challenge", padding=8)
+    launch.pack(fill="x")
+    agent_var = tk.StringVar(value=list(cfg["agents"])[0])
+    mode_var = tk.StringVar(value="terminal")
+    ttk.Combobox(launch, textvariable=agent_var, values=list(cfg["agents"]), state="readonly", width=24).pack(side="left")
+    ttk.Radiobutton(launch, text="in a terminal window", variable=mode_var, value="terminal").pack(side="left", padx=6)
+    ttk.Radiobutton(launch, text="in the background (log)", variable=mode_var, value="background").pack(side="left")
+
+    def launch_agent(agent=None, mode=None):
+        ch = need_ch()
+        if not ch:
+            return
+        save_meta(quiet=True)
+        if not prompt_txt.get("1.0", "end").strip():
+            regen_prompt()
+        prompt = prompt_text()
+        agent = agent or agent_var.get()
+        mode = mode or mode_var.get()
+        try:
+            rec = start_run(cfg, agent, ch, prompt, mode)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Launch failed", str(e))
+            return
+        root.clipboard_clear()
+        root.clipboard_append(prompt)
+        say(f"started {agent} on {ch.name} ({mode}); prompt copied to clipboard")
+        refresh_agents()
+        nb.select(t_agents)
+        return rec
+
+    ttk.Button(launch, text="Launch", style="Big.TButton", command=launch_agent).pack(side="left", padx=10)
+
+    ttk.Label(t_agents, text="Started from CTF Studio", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(10, 2))
+    run_tree = ttk.Treeview(t_agents, columns=("agent", "challenge", "mode", "status", "pid", "started"),
+                            show="headings", height=8)
+    for c, w in (("agent", 170), ("challenge", 160), ("mode", 90), ("status", 110), ("pid", 70), ("started", 140)):
+        run_tree.heading(c, text=c)
+        run_tree.column(c, width=w, anchor="w")
+    run_tree.pack(fill="both", expand=True)
+    rb = ttk.Frame(t_agents)
+    rb.pack(fill="x", pady=4)
+    ttk.Label(t_agents, text="All agent processes on this machine (codex / claude / agy / ctfsolve, however they were started)",
+              font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(10, 2))
+    proc_tree = ttk.Treeview(t_agents, columns=("pid", "name", "challenge", "cwd", "cmd"), show="headings", height=6)
+    for c, w in (("pid", 70), ("name", 90), ("challenge", 140), ("cwd", 260), ("cmd", 400)):
+        proc_tree.heading(c, text=c)
+        proc_tree.column(c, width=w, anchor="w")
+    proc_tree.pack(fill="both", expand=True)
+    pb2 = ttk.Frame(t_agents)
+    pb2.pack(fill="x", pady=4)
+    runs_by_id: dict[str, dict] = {}
+
+    def refresh_agents():
+        sel = run_tree.selection()
+        run_tree.delete(*run_tree.get_children())
+        runs_by_id.clear()
+        for r in list_runs():
+            st, pid = run_status(r)
+            runs_by_id[r["id"]] = r
+            run_tree.insert("", "end", iid=r["id"], values=(
+                r["agent"], r["challenge"], r["mode"], st, pid or "",
+                _dt.datetime.fromtimestamp(r.get("started", 0)).strftime("%m-%d %H:%M:%S")))
+        for s in sel:
+            if run_tree.exists(s):
+                run_tree.selection_add(s)
+        psel = proc_tree.selection()
+        proc_tree.delete(*proc_tree.get_children())
+        for p in scan_agent_processes():
+            proc_tree.insert("", "end", iid=str(p["pid"]),
+                             values=(p["pid"], p["name"], p["challenge"], p["cwd"], p["cmd"]))
+        for s in psel:
+            if proc_tree.exists(s):
+                proc_tree.selection_add(s)
+
+    def stop_run():
+        for rid in run_tree.selection():
+            st, pid = run_status(runs_by_id[rid])
+            if pid and st == "running":
+                stop_tree(pid)
+        root.after(800, refresh_agents)
+
+    def view_log():
+        for rid in run_tree.selection():
+            r = runs_by_id[rid]
+            if r.get("log") and Path(r["log"]).exists():
+                show_text_window(f"log: {r['agent']} on {r['challenge']}", Path(r["log"]))
+            else:
+                messagebox.showinfo("Log", "Terminal runs show their output in their own window.")
+
+    def forget_finished():
+        for rid, r in list(runs_by_id.items()):
+            if run_status(r)[0] not in ("running", "starting"):
+                forget_run(rid)
+        refresh_agents()
+
+    def select_run_challenge(_e=None):
+        s = run_tree.selection()
+        if s:
+            select_by_name(runs_by_id[s[0]]["challenge"])
+
+    def stop_proc():
+        pids = [int(s) for s in proc_tree.selection()]
+        if pids and messagebox.askyesno("Stop", f"Send SIGTERM to {', '.join(map(str, pids))}?"):
+            for pid in pids:
+                stop_tree(pid)
+            root.after(800, refresh_agents)
+
+    run_tree.bind("<Double-1>", select_run_challenge)
+    ttk.Button(rb, text="Stop", command=stop_run).pack(side="left")
+    ttk.Button(rb, text="View log", command=view_log).pack(side="left", padx=4)
+    ttk.Button(rb, text="Go to challenge", command=select_run_challenge).pack(side="left")
+    ttk.Button(rb, text="Clear finished", command=forget_finished).pack(side="left", padx=4)
+    ttk.Button(rb, text="↻", width=3, command=refresh_agents).pack(side="right")
+    ttk.Button(pb2, text="Stop process", command=stop_proc).pack(side="left")
+
+    def show_text_window(title: str, path: Path):
+        w = tk.Toplevel(root)
+        w.title(title)
+        w.geometry("900x600")
+        t = ScrolledText(w, wrap="word", font=mono)
+        t.pack(fill="both", expand=True)
+
+        def load():
+            if not w.winfo_exists():
+                return
+            try:
+                data = path.read_text(errors="replace")[-200_000:]
+            except OSError:
+                data = "(log not found)"
+            at_end = t.yview()[1] > 0.98
+            t.delete("1.0", "end")
+            t.insert("1.0", data)
+            if at_end:
+                t.see("end")
+            w.after(2000, load)
+        load()
+
+    # ================================================== tools tab
+    tb = ttk.Frame(t_tools)
+    tb.pack(fill="x")
+    out = ScrolledText(t_tools, wrap="word", font=mono, background="#111", foreground="#ddd",
+                       insertbackground="#ddd")
+    out.pack(fill="both", expand=True, pady=6)
+    proc_box = {"p": None}
+
+    def run_tool(argv: list[str], cwd: Path | None = None):
+        if proc_box["p"] and proc_box["p"].poll() is None:
+            messagebox.showinfo("Busy", "A tool is still running. Press Stop tool first.")
+            return
+        nb.select(t_tools)
+        out.insert("end", f"\n$ {' '.join(shlex.quote(a) for a in argv)}\n")
+        out.see("end")
+        try:
+            p = subprocess.Popen(argv, cwd=str(cwd) if cwd else None, env={**ENV, "NO_COLOR": "1"},
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, errors="replace",
+                                 start_new_session=True)
+        except Exception as e:  # noqa: BLE001
+            out.insert("end", f"error: {e}\n")
+            return
+        proc_box["p"] = p
+        say("running " + os.path.basename(argv[1] if argv[0] == sys.executable else argv[0]))
+
+        def pump():
+            for line in p.stdout:
+                out_q.put(line)
+            p.wait()
+            out_q.put(f"[exit {p.returncode}]\n")
+            out_q.put(None)
+        threading.Thread(target=pump, daemon=True).start()
+
+    def drain():
+        try:
+            while True:
+                item = out_q.get_nowait()
+                if item is None:
+                    say("ready")
+                    ch = cur()
+                    if ch:
+                        f = ch.flag()
+                        flag_var.set(f"FLAG: {f}" if f else "")
+                        load_files()
+                        load_challenges(keep=ch.name)
+                    continue
+                out.insert("end", item)
+                out.see("end")
+        except queue.Empty:
+            pass
+        root.after(100, drain)
+
+    def stop_tool():
+        p = proc_box["p"]
+        if p and p.poll() is None:
+            stop_tree(p.pid)
+
+    def ch_args(ch: Challenge) -> list[str]:
+        m = ch.meta()
+        a = []
+        if m.get("description", "").strip():
+            a += ["--desc", m["description"].strip()]
+        if m.get("url"):
+            a += ["--url", m["url"]]
+        if m.get("nc"):
+            a += ["--nc", m["nc"]]
+        return a
+
+    def do_triage():
+        ch = need_ch()
+        if ch:
+            save_meta(quiet=True)
+            run_tool(tool_argv("ctftriage", *ch_args(ch)), ch.path)
+
+    def do_scan():
+        ch = need_ch()
+        if ch:
+            m = ch.meta()
+            fmt = ["--format", m["flag_format"]] if m.get("flag_format") else []
+            run_tool(tool_argv("ctfflag", *fmt, "scan", "--record"), ch.path)
+
+    def do_decode():
+        s = simpledialog.askstring("Decode", "Text to decode (base64/hex/rot/…):", parent=root)
+        if s:
+            run_tool(tool_argv("ctfflag", "decode", s), cur().path if cur() else None)
+
+    def do_verify():
+        ch = cur()
+        f = simpledialog.askstring("Verify flag", "Flag:", initialvalue=ch.flag() if ch else "", parent=root)
+        if not f:
+            return
+        c = simpledialog.askstring("Verify flag", "Solver command that prints it (optional):", parent=root)
+        argv = tool_argv("ctfflag", "verify", f) + (["--cmd", c] if c else [])
+        run_tool(argv, ch.path if ch else None)
+
+    def do_solve_bg():
+        launch_agent("ctfsolve (any model)", "background")
+
+    row1 = ttk.Frame(tb)
+    row1.pack(fill="x")
+    for label, fn in (("Triage", do_triage), ("Flag scan", do_scan), ("Decode…", do_decode),
+                      ("Verify flag…", do_verify), ("ctfsolve (background)", do_solve_bg)):
+        ttk.Button(row1, text=label, style="Big.TButton", command=fn).pack(side="left", padx=2)
+    ttk.Button(row1, text="Stop tool", command=stop_tool).pack(side="right")
+    ttk.Button(row1, text="Clear", command=lambda: out.delete("1.0", "end")).pack(side="right", padx=4)
+    row2 = ttk.Frame(tb)
+    row2.pack(fill="x", pady=(6, 0))
+    ttk.Label(row2, text="MCP profile").pack(side="left")
+    prof_var = tk.StringVar(value="off")
+    prof_cb = ttk.Combobox(row2, textvariable=prof_var, values=PROFILES, state="readonly", width=10)
+    prof_cb.pack(side="left", padx=4)
+
+    def suggest_profile():
+        ch = cur()
+        if ch:
+            cat = ch.meta().get("category", "")
+            prof_var.set(cat if cat in PROFILES else "off")
+
+    ttk.Button(row2, text="Apply", command=lambda: run_tool(tool_argv("ctf-mcp", prof_var.get()))).pack(side="left")
+    ttk.Button(row2, text="MCP status", command=lambda: run_tool(tool_argv("ctf-mcp", "status"))).pack(side="left", padx=4)
+    ttk.Separator(row2, orient="vertical").pack(side="left", fill="y", padx=8)
+    ttk.Button(row2, text="Model: show", command=lambda: run_tool(tool_argv("ctfmodel", "show"))).pack(side="left")
+    ttk.Button(row2, text="Model: test", command=lambda: run_tool(tool_argv("ctfmodel", "test"))).pack(side="left", padx=4)
+    ttk.Button(row2, text="Model: list", command=lambda: run_tool(tool_argv("ctfmodel", "list"))).pack(side="left")
+    ttk.Separator(row2, orient="vertical").pack(side="left", fill="y", padx=8)
+    ttk.Button(row2, text="Doctor", command=lambda: run_tool(tool_argv("ctfdoctor"))).pack(side="left")
+    ttk.Button(row2, text="ctfhub (terminal)", command=lambda: open_terminal_here(["ctfhub"])).pack(side="left", padx=4)
+
+    # ---------- shared actions
+    def open_terminal_here(argv: list[str] | None = None):
+        term = find_terminal(cfg.get("terminal", ""))
+        if not term:
+            messagebox.showerror("Terminal", "No terminal emulator found.")
+            return
+        cwd = str(cur().path) if cur() else str(CTF_HOME)
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        script = RUNS_DIR / "shell-here.sh"
+        inner = (" ".join(shlex.quote(a) for a in tool_argv(argv[0], *argv[1:])) + "; ") if argv else ""
+        script.write_text("#!/usr/bin/env bash\n"
+                          f"export PATH={shlex.quote(ENV['PATH'])}\n"
+                          f"cd {shlex.quote(cwd)}\n{inner}exec \"${{SHELL:-bash}}\" -i\n")
+        script.chmod(0o700)
+        subprocess.Popen(term + [str(script)], env=ENV, cwd=cwd, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    for label, agent in (("cx", "Codex (cx)"), ("agy", "Antigravity (agy)"), ("cl", "Claude Code (cl)")):
+        if agent in cfg["agents"]:
+            ttk.Button(quick, text=f"▶ {label}", style="Big.TButton",
+                       command=lambda a=agent: launch_agent(a, "terminal")).pack(side="left", padx=2)
+    ttk.Button(quick, text="Triage", command=do_triage).pack(side="left", padx=(10, 2))
+    ttk.Button(quick, text="Flag scan", command=do_scan).pack(side="left", padx=2)
+
+    # ---------- challenge list
+    def load_challenges(keep: str | None = None):
+        keep = keep or (cur().name if cur() else None)
+        chal_tree.delete(*chal_tree.get_children())
+        for ch in list_challenges():
+            try:
+                m = ch.meta()
+            except Exception:  # noqa: BLE001
+                m = {"category": "?"}
+            chal_tree.insert("", "end", iid=ch.name, text=ch.name,
+                             values=(m.get("category", "?"), "✓" if ch.flag() else ""))
+        if keep and chal_tree.exists(keep):
+            chal_tree.selection_set(keep)
+            chal_tree.see(keep)
+
+    def show_challenge(ch: Challenge, keep_prompt=False):
+        state["ch"] = ch
+        m = ch.meta()
+        title_var.set(f"{ch.name}   —   {ch.path}")
+        for k, v in fields.items():
+            v.set(m.get(k, ""))
+        desc_txt.delete("1.0", "end")
+        desc_txt.insert("1.0", m.get("description", ""))
+        f = ch.flag()
+        flag_var.set(f"FLAG: {f}" if f else "")
+        if not keep_prompt:
+            extra_txt.delete("1.0", "end")
+            pf = ch.path / "notes" / "prompt.md"
+            prompt_txt.delete("1.0", "end")
+            prompt_txt.insert("1.0", pf.read_text(errors="replace") if pf.exists() else build_prompt(ch))
+            suggest_profile()
+            load_files()
+            state["edit_path"] = None
+            editor.delete("1.0", "end")
+            edit_lbl.set("(open a text file from the list)")
+        root.title(f"CTF Studio — {ch.name}")
+        try:
+            last_file.write_text(json.dumps({"challenge": ch.name}))
+        except OSError:
+            pass
+
+    def on_select(_e=None):
+        s = chal_tree.selection()
+        if s and (not cur() or cur().name != s[0]):
+            show_challenge(Challenge(CTF_HOME / s[0]))
+
+    def select_by_name(name: str):
+        if chal_tree.exists(name):
+            chal_tree.selection_set(name)
+            chal_tree.see(name)
+            on_select()
+            nb.select(t_info)
+
+    def new_challenge():
+        w = tk.Toplevel(root)
+        w.title("New challenge")
+        w.transient(root)
+        w.grab_set()
+        f = ttk.Frame(w, padding=12)
+        f.pack(fill="both", expand=True)
+        nv, cv = tk.StringVar(), tk.StringVar(value="misc")
+        ttk.Label(f, text="Name (letters, digits, . _ -)").grid(row=0, column=0, sticky="w")
+        e = ttk.Entry(f, textvariable=nv, width=32)
+        e.grid(row=0, column=1, padx=6, pady=3)
+        ttk.Label(f, text="Category").grid(row=1, column=0, sticky="w")
+        ttk.Combobox(f, textvariable=cv, values=CATS, width=30).grid(row=1, column=1, padx=6, pady=3)
+        e.focus_set()
+
+        def ok(_e=None):
+            name = nv.get().strip().replace(" ", "-")
+            if not name:
+                return
+            cp = subprocess.run(tool_argv("ctfnew", name, cv.get().strip() or "misc"),
+                                capture_output=True, text=True, env=ENV)
+            if cp.returncode != 0 or not (CTF_HOME / name).is_dir():
+                messagebox.showerror("ctfnew failed", (cp.stderr or cp.stdout or "unknown error").strip(), parent=w)
+                return
+            w.destroy()
+            load_challenges(keep=name)
+            select_by_name(name)
+            say(f"created {CTF_HOME / name}; add files in the Files tab")
+            nb.select(t_files)
+
+        ttk.Button(f, text="Create", command=ok).grid(row=2, column=1, sticky="e", pady=(8, 0))
+        w.bind("<Return>", ok)
+
+    chal_tree.bind("<<TreeviewSelect>>", on_select)
+    ttk.Button(lb, text="+ New challenge", style="Big.TButton", command=new_challenge).pack(side="left")
+    ttk.Button(lb, text="↻", width=3, command=load_challenges).pack(side="right")
+
+    # ---------- startup
+    def tick():
+        try:
+            refresh_agents()
+        except Exception as e:  # noqa: BLE001
+            say(f"agent refresh error: {e}")
+        root.after(3000, tick)
+
+    refresh_info()
+    load_challenges()
+    try:
+        last = json.loads(last_file.read_text()).get("challenge")
+    except Exception:  # noqa: BLE001
+        last = None
+    first = last if last and chal_tree.exists(last) else (chal_tree.get_children() or [None])[0]
+    if first:
+        select_by_name(first)
+    drain()
+    tick()
+    root.mainloop()
+    return 0
+
+
+def check() -> int:
+    cfg = load_config()
+    print(f"ctf home : {CTF_HOME} ({len(list_challenges())} challenges)")
+    for name, spec in cfg["agents"].items():
+        print(f"agent    : {name:22} {'found' if which(spec['bin']) else 'MISSING'}")
+    term = find_terminal(cfg.get("terminal", ""))
+    print(f"terminal : {' '.join(term) if term else 'none found'}")
+    for t in ("ctfnew", "ctftriage", "ctfflag", "ctfsolve", "ctfmodel", "ctf-mcp", "ctfdoctor"):
+        print(f"helper   : {t:10} {'found' if which(t) else 'MISSING'}")
+    try:
+        import tkinter  # noqa: F401
+        print("tkinter  : ok")
+    except ImportError:
+        print("tkinter  : MISSING  ->  sudo apt-get install -y python3-tk")
+        return 1
+    print(f"display  : {os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY') or 'none (GUI needs a desktop session)'}")
+    print(f"runs     : {len(list_runs())} recorded, {len(scan_agent_processes())} agent processes running")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="ctfstudio", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--check", action="store_true", help="print environment status and exit")
+    a = ap.parse_args(argv)
+    if a.check:
+        return check()
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        print("ctfstudio needs Tk: sudo apt-get install -y python3-tk", file=sys.stderr)
+        return 1
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        print("ctfstudio needs a desktop session (no DISPLAY). Use `ctfhub` in a plain terminal.",
+              file=sys.stderr)
+        return 1
+    return run_gui(load_config())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
