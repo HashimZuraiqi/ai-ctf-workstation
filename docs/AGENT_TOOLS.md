@@ -35,6 +35,37 @@ prefix. `verify` accepts a flag only if it matches the format **and** a solver c
 reproduces it — this is what stops weaker models reporting made-up flags. Set the format
 per workspace with `ctfflag format`, the `CTF_FLAG_REGEX` env var, or `--format`.
 
+## ctfmodel - pick the model ctfsolve uses (open-source via API key)
+
+`ctfsolve` works with any OpenAI-compatible endpoint. `ctfmodel` configures it for
+you with ready presets for open-weight model hosts, so you only paste an API key.
+
+```bash
+ctfmodel list                       # see providers and default models
+ctfmodel use openrouter --key sk-or-...      # one key, huge open-model catalog
+ctfmodel use groq --key gsk_...              # very fast Llama/Qwen, free tier
+ctfmodel use together "Qwen/Qwen2.5-Coder-32B-Instruct" --key ...
+ctfmodel use deepseek --key sk-...           # cheap, strong at code
+ctfmodel use ollama qwen2.5-coder            # local, no key (needs a GPU)
+ctfmodel key <YOUR_KEY>             # set/replace the key later
+ctfmodel show                       # current config (key masked)
+ctfmodel test                       # 1-token request to confirm it works
+```
+
+Presets (all open-weight hosts unless noted): `openrouter`, `together`, `groq`,
+`deepseek`, `fireworks`, `hyperbolic`, `nebius`, `openai` (not open), and local
+`ollama` / `vllm` / `lmstudio`, plus `custom` for any other endpoint (`--base URL`).
+
+The choice is saved to `~/.config/ctf-ai/ctfsolve.env` (git-ignored, chmod 600) and
+loaded automatically by `ctfsolve` and by a new shell. A stronger planner model is
+optional: `ctfmodel use <provider> <model> --planner <bigger-model>`.
+
+Then just:
+
+```bash
+ctfmodel test && ctfsolve --desc "challenge text" --nc host:port
+```
+
 ## ctfsolve — model-agnostic autosolver (optional)
 
 ```bash

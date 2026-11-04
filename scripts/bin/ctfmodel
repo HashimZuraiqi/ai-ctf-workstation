@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""ctfmodel - configure which model ctfsolve uses, for open-source models via API keys.
+
+It writes an env file (~/.config/ctf-ai/ctfsolve.env) that ctfsolve and your shell
+load automatically. Pick a provider preset, paste your API key, done. Every listed
+provider is OpenAI-compatible, so ctfsolve drives them all the same way.
+
+Usage:
+  ctfmodel list                         show provider presets and their default models
+  ctfmodel use PROVIDER [MODEL]         select a provider (and optionally override the model)
+  ctfmodel use PROVIDER --key KEY       also store the API key
+  ctfmodel key KEY                      set/replace the API key for the current provider
+  ctfmodel show                         print the current config (key masked)
+  ctfmodel test                         send a 1-token request to check the endpoint works
+  ctfmodel env                          print export lines to eval in a shell
+
+Providers (open-weight model hosts + local runners):
+  openrouter together groq deepseek fireworks hyperbolic nebius openai ollama vllm lmstudio custom
+
+Examples:
+  ctfmodel use openrouter --key sk-or-...
+  ctfmodel use together "Qwen/Qwen2.5-Coder-32B-Instruct"
+  ctfmodel use ollama qwen2.5-coder           # local, no key needed
+  ctfsolve --desc "..."                        # now uses your choice
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("CTFSOLVE_ENV_FILE", str(Path.home() / ".config/ctf-ai/ctfsolve.env")))
+
+# provider -> (api_base, default_model, needs_key, note)
+PROVIDERS = {
+    "openrouter": ("https://openrouter.ai/api/v1", "deepseek/deepseek-chat", True,
+                   "Huge open-model catalog; one key for Llama/Qwen/DeepSeek/Mistral. Many free-tier models."),
+    "together":   ("https://api.together.xyz/v1", "Qwen/Qwen2.5-Coder-32B-Instruct", True,
+                   "Open models (Llama, Qwen, DeepSeek-V3) at good speed."),
+    "groq":       ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", True,
+                   "Very fast open models (Llama, Qwen). Generous free tier."),
+    "deepseek":   ("https://api.deepseek.com/v1", "deepseek-chat", True,
+                   "DeepSeek's own API (open-weight models); cheap and strong at code."),
+    "fireworks":  ("https://api.fireworks.ai/inference/v1", "accounts/fireworks/models/qwen2p5-coder-32b-instruct", True,
+                   "Open models on Fireworks."),
+    "hyperbolic": ("https://api.hyperbolic.xyz/v1", "Qwen/Qwen2.5-Coder-32B-Instruct", True,
+                   "Cheap open-model inference."),
+    "nebius":     ("https://api.studio.nebius.ai/v1", "Qwen/Qwen2.5-Coder-32B-Instruct", True,
+                   "Open models via Nebius AI Studio."),
+    "openai":     ("https://api.openai.com/v1", "gpt-4o-mini", True,
+                   "OpenAI (not open-source, but same interface if you have a key)."),
+    "ollama":     ("http://localhost:11434/v1", "qwen2.5-coder", False,
+                   "Local models via Ollama. No key. `ollama pull qwen2.5-coder` first. Needs a decent GPU to be fast."),
+    "vllm":       ("http://localhost:8000/v1", "", False,
+                   "Local vLLM server. Set the model you served."),
+    "lmstudio":   ("http://localhost:1234/v1", "", False,
+                   "Local LM Studio server. Set the loaded model."),
+    "custom":     ("", "", False, "Any OpenAI-compatible endpoint. Pass MODEL and set the base with --base."),
+}
+
+
+def load() -> dict[str, str]:
+    data: dict[str, str] = {}
+    if CONFIG.exists():
+        for line in CONFIG.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:]
+            if "=" in line:
+                k, _, v = line.partition("=")
+                data[k.strip()] = v.strip().strip('"').strip("'")
+    return data
+
+
+def save(data: dict[str, str]):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# ctfsolve model configuration (written by ctfmodel). Do not commit this file.",
+             "# Loaded automatically by ctfsolve and by the workstation shell profile."]
+    for k in ("CTFSOLVE_PROVIDER", "CTFSOLVE_API_BASE", "CTFSOLVE_MODEL",
+              "CTFSOLVE_PLANNER_MODEL", "CTFSOLVE_API_KEY"):
+        if data.get(k):
+            lines.append(f'export {k}="{data[k]}"')
+    CONFIG.write_text("\n".join(lines) + "\n")
+    try:
+        CONFIG.chmod(0o600)
+    except OSError:
+        pass
+
+
+def mask(key: str) -> str:
+    if not key:
+        return "(none)"
+    return key[:6] + "..." + key[-4:] if len(key) > 12 else "***"
+
+
+def cmd_list(_a):
+    print(f"{'provider':<12} {'key?':<5} {'default model':<48} base")
+    print("-" * 110)
+    for name, (base, model, needs, _note) in PROVIDERS.items():
+        print(f"{name:<12} {'yes' if needs else 'no':<5} {model or '(set one)':<48} {base or '(set --base)'}")
+    print("\nPick one with:  ctfmodel use <provider> [model] [--key KEY]")
+    print("Then run:       ctfsolve --desc \"challenge text\"")
+    return 0
+
+
+def cmd_use(a):
+    prov = a.provider.lower()
+    if prov not in PROVIDERS:
+        print(f"unknown provider: {prov}. Run `ctfmodel list`.", file=sys.stderr)
+        return 2
+    base, default_model, needs_key, note = PROVIDERS[prov]
+    data = load()
+    data["CTFSOLVE_PROVIDER"] = prov
+    data["CTFSOLVE_API_BASE"] = a.base or base
+    data["CTFSOLVE_MODEL"] = a.model or default_model
+    if a.planner:
+        data["CTFSOLVE_PLANNER_MODEL"] = a.planner
+    if a.key:
+        data["CTFSOLVE_API_KEY"] = a.key
+    if not data.get("CTFSOLVE_API_BASE"):
+        print("This provider needs --base <url>.", file=sys.stderr)
+        return 2
+    if not data.get("CTFSOLVE_MODEL"):
+        print("No model set. Pass one: ctfmodel use " + prov + " <model>", file=sys.stderr)
+        return 2
+    save(data)
+    print(f"Configured ctfsolve -> {prov}")
+    print(f"  base:  {data['CTFSOLVE_API_BASE']}")
+    print(f"  model: {data['CTFSOLVE_MODEL']}")
+    print(f"  key:   {mask(data.get('CTFSOLVE_API_KEY',''))}")
+    print(f"  note:  {note}")
+    if needs_key and not data.get("CTFSOLVE_API_KEY"):
+        print(f"\n  >> Add your API key:  ctfmodel key <YOUR_KEY>")
+    print(f"\nSaved to {CONFIG}. Open a new shell (or `source {CONFIG}`) and run `ctfsolve`.")
+    return 0
+
+
+def cmd_key(a):
+    data = load()
+    if not data.get("CTFSOLVE_PROVIDER"):
+        print("Pick a provider first: ctfmodel use <provider>", file=sys.stderr)
+        return 2
+    data["CTFSOLVE_API_KEY"] = a.key
+    save(data)
+    print(f"API key stored for {data['CTFSOLVE_PROVIDER']} ({mask(a.key)}).")
+    return 0
+
+
+def cmd_show(_a):
+    data = load()
+    if not data:
+        print("No config yet. Run `ctfmodel use <provider>`.")
+        return 0
+    for k, v in data.items():
+        print(f"{k}={mask(v) if k == 'CTFSOLVE_API_KEY' else v}")
+    return 0
+
+
+def cmd_env(_a):
+    data = load()
+    for k, v in data.items():
+        print(f'export {k}="{v}"')
+    return 0
+
+
+def cmd_test(_a):
+    data = load()
+    base = data.get("CTFSOLVE_API_BASE")
+    model = data.get("CTFSOLVE_MODEL")
+    if not base or not model:
+        print("Not configured. Run `ctfmodel use <provider>`.", file=sys.stderr)
+        return 2
+    body = json.dumps({"model": model, "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "ping"}]}).encode()
+    req = urllib.request.Request(base.rstrip("/") + "/chat/completions", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if data.get("CTFSOLVE_API_KEY"):
+        req.add_header("Authorization", "Bearer " + data["CTFSOLVE_API_KEY"])
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            j = json.loads(r.read().decode())
+        got = j.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(f"OK: {model} at {base} responded ({got!r:.40}).")
+        return 0
+    except urllib.error.HTTPError as e:
+        print(f"HTTP {e.code} from {base}: {e.read().decode()[:300]}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as e:
+        print(f"Cannot reach {base}: {e}. For local runners, start the server first.", file=sys.stderr)
+        return 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ctfmodel", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("list")
+    u = sub.add_parser("use")
+    u.add_argument("provider")
+    u.add_argument("model", nargs="?")
+    u.add_argument("--key")
+    u.add_argument("--base", help="override the API base URL")
+    u.add_argument("--planner", help="stronger model for planning / when stuck")
+    k = sub.add_parser("key")
+    k.add_argument("key")
+    sub.add_parser("show")
+    sub.add_parser("env")
+    sub.add_parser("test")
+    a = ap.parse_args(argv)
+    if not a.cmd:
+        ap.print_help()
+        return 2
+    return {"list": cmd_list, "use": cmd_use, "key": cmd_key,
+            "show": cmd_show, "env": cmd_env, "test": cmd_test}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -37,3 +37,7 @@ __pycache__/
 .auth/
 *oauth*
 *cookies*
+
+# ctfsolve model config (may contain API keys)
+ctfsolve.env
+.config/ctf-ai/ctfsolve.env
