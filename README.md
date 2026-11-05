@@ -33,6 +33,16 @@ This repository packages the workstation we built and tested into one team-frien
 - `ghidra-ai` to launch Ghidra with Java 21 without changing Kali's global Java
 - `ctfdoctor` to verify the workstation before a competition
 
+## One-command setup from zero
+
+On a fresh Kali install, paste this as your normal user (not root). It installs git, clones this repo into `~/tools/ai-ctf-workstation`, runs every install phase, wires the shell and runs `ctfdoctor`. It is safe to re-run, and a failing phase does not stop the others.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/HashimZuraiqi/ai-ctf-workstation/main/setup.sh)
+```
+
+Useful flags: `--only 20,80` (run just those phases), `--skip 36,50`, `--no-update`, `--stop-on-error`. Set `CTF_SKIP_SAGE=1` to skip the large SageMath install. The log goes to `~/.local/state/ctf-ai/`.
+
 ## Fastest teammate setup
 
 Recommended: start from a clean/recent **Kali Rolling VM snapshot** with at least ~8 GB RAM and enough free disk space for Ghidra, browsers, Python packages and challenge artifacts.
