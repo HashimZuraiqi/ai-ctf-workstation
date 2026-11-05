@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 required=(
-  README.md SECURITY.md LICENSE scripts/bootstrap.sh scripts/repair-kali-apt.sh scripts/publish-github.sh
+  README.md SECURITY.md LICENSE setup.sh scripts/bootstrap.sh scripts/repair-kali-apt.sh scripts/publish-github.sh
   scripts/bin/ctfnew scripts/bin/ctf-mcp scripts/bin/ctfdoctor scripts/bin/ghidra-ai
   scripts/bin/ctftriage scripts/bin/ctfflag scripts/bin/ctfsolve scripts/bin/ctfmodel scripts/bin/ctfhub scripts/bin/ctfstudio scripts/update.sh
   scripts/install/35-forensics.sh scripts/install/36-crypto.sh scripts/install/37-osint.sh scripts/install/55-category-mcps.sh
@@ -15,6 +15,7 @@ required=(
   skills/ctf-mobile/SKILL.md skills/ctf-misc/SKILL.md skills/ctf-report/SKILL.md
 )
 for f in "${required[@]}"; do [[ -e "$ROOT/$f" ]] || { echo "missing: $f" >&2; exit 1; }; done
+bash -n "$ROOT/setup.sh"
 while IFS= read -r -d '' f; do bash -n "$f"; done < <(find "$ROOT/scripts" "$ROOT/tests" -type f -name '*.sh' -print0)
 for f in "$ROOT"/scripts/bin/*; do [[ -f "$f" ]] || continue; if head -1 "$f" | grep -Eq "bash|/sh$"; then bash -n "$f"; fi; done
 python3 - <<PY_TEST
